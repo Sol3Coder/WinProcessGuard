@@ -19,19 +19,35 @@ impl Guardian {
     pub fn new(running: Arc<Mutex<bool>>) -> Self {
         info!("Initializing Guardian...");
 
-        let config = load_config();
+        let mut config = load_config();
         let mut processes = HashMap::new();
 
         info!("Loaded {} monitor items from config", config.items.len());
 
-        for item in &config.items {
-            if item.enabled {
-                let monitored = MonitoredProcess::from_item(item.clone());
-                processes.insert(item.id.clone(), monitored);
-                info!("Added monitor item: {} ({})", item.name, item.exe_path);
-            } else {
-                info!("Monitor item {} is disabled, skipping", item.name);
+        // Force enable all monitor items on startup
+        let mut config_modified = false;
+        for item in &mut config.items {
+            if !item.enabled {
+                item.enabled = true;
+                config_modified = true;
+                info!("Force enabled monitor item on startup: {}", item.name);
             }
+        }
+
+        // Save config if modified
+        if config_modified {
+            if let Err(e) = crate::config::save_config(&config) {
+                error!("Failed to save config after force enable: {}", e);
+            } else {
+                info!("Saved config with all items force enabled");
+            }
+        }
+
+        // Add all monitor items to processes (all are now enabled)
+        for item in &config.items {
+            let monitored = MonitoredProcess::from_item(item.clone());
+            processes.insert(item.id.clone(), monitored);
+            info!("Added monitor item: {} ({})", item.name, item.exe_path);
         }
 
         Self {
