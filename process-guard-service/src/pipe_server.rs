@@ -52,7 +52,7 @@ impl PipeServer {
             let pipe_handle = unsafe {
                 CreateNamedPipeW(
                     PCWSTR(pipe_name_wide.as_ptr()),
-                    FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE.0),
+                    FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX),
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                     MAX_INSTANCES,
                     BUFFER_SIZE,
@@ -74,11 +74,13 @@ impl PipeServer {
 
             if connect_result.is_err() {
                 let err = windows::core::Error::from_win32();
-                error!("ConnectNamedPipe failed: {:?}", err);
-                unsafe {
-                    let _ = CloseHandle(pipe_handle);
+                if err.code() != windows::Win32::Foundation::ERROR_PIPE_CONNECTED.into() {
+                    error!("ConnectNamedPipe failed: {:?}", err);
+                    unsafe {
+                        let _ = CloseHandle(pipe_handle);
+                    }
+                    continue;
                 }
-                continue;
             }
 
             info!("Client connected to pipe server");
