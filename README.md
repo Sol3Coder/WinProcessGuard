@@ -1,6 +1,7 @@
 # WinProcessGuard
 
 vibecoding 的windows下进程守护，服务端为rust 编写的windows 服务，  客户端是cpp类，集成到cpp程序中完成进程守护（自监控），也可以自行完成GUI部分实现对任意进程的守护。  
+只进行过少量的功能测试，确认了在我的环境下正常运行，在你的环境下使用前请自行测试
 
 ```cpp
     std::string servicePath = ProcessGuard::Client::GetCurrentExeDir() + "\\processguard\\process-guard-service.exe";
