@@ -1,6 +1,8 @@
 use crate::config::load_config;
 use crate::models::{ChangeType, Config, ConfigChange, MonitoredProcess, CHECK_INTERVAL_MS};
-use crate::session0::{check_process_alive, find_process_by_path, kill_process, start_process_in_session0};
+use crate::session0::{
+    check_process_alive, find_process_by_path, kill_process, start_process_in_session0,
+};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,7 +18,7 @@ pub struct Guardian {
 impl Guardian {
     pub fn new(running: Arc<Mutex<bool>>) -> Self {
         info!("Initializing Guardian...");
-        
+
         let config = load_config();
         let mut processes = HashMap::new();
 
@@ -63,7 +65,10 @@ impl Guardian {
         let mut processes = self.processes.lock().unwrap();
         if let Some(process) = processes.get_mut(item_id) {
             process.update_heartbeat();
-            debug!("Heartbeat updated for: {} (item: {})", process.item.name, item_id);
+            debug!(
+                "Heartbeat updated for: {} (item: {})",
+                process.item.name, item_id
+            );
             true
         } else {
             warn!("Heartbeat update failed, item not found: {}", item_id);
@@ -78,7 +83,7 @@ impl Guardian {
         self.start_all_processes();
 
         let mut check_count: u64 = 0;
-        
+
         loop {
             let running = *self.running.lock().unwrap();
             if !running {
@@ -100,12 +105,15 @@ impl Guardian {
 
     fn start_all_processes(&self) {
         info!("Starting all monitored processes...");
-        
+
         let processes = self.processes.lock().unwrap().clone();
-        
+
         for (id, mut process) in processes {
             if process.item.enabled {
-                info!("Starting process: {} ({})", process.item.name, process.item.exe_path);
+                info!(
+                    "Starting process: {} ({})",
+                    process.item.name, process.item.exe_path
+                );
                 if let Err(e) = self.start_process(&mut process) {
                     error!("Failed to start process {}: {}", process.item.name, e);
                 } else {
@@ -114,20 +122,22 @@ impl Guardian {
                 }
             }
         }
-        
+
         info!("All processes startup completed");
     }
 
     fn check_processes(&self) {
         let mut processes = self.processes.lock().unwrap();
-        
+
         for (_id, process) in processes.iter_mut() {
             if !process.item.enabled {
                 debug!("Process {} is disabled, skipping check", process.item.name);
                 continue;
             }
 
-            let process_alive = process.process_id.map_or(false, |pid| check_process_alive(pid));
+            let process_alive = process
+                .process_id
+                .map_or(false, |pid| check_process_alive(pid));
             let heartbeat_ok = !process.is_heartbeat_timeout();
 
             info!(
@@ -141,7 +151,11 @@ impl Guardian {
             );
 
             if !process_alive || !heartbeat_ok {
-                let reason = if !process_alive { "process not alive" } else { "heartbeat timeout" };
+                let reason = if !process_alive {
+                    "process not alive"
+                } else {
+                    "heartbeat timeout"
+                };
                 warn!(
                     "Process {} needs restart: {} (restart count: {})",
                     process.item.name, reason, process.restart_count
@@ -149,7 +163,10 @@ impl Guardian {
 
                 if let Some(pid) = process.process_id {
                     if check_process_alive(pid) {
-                        info!("Killing existing process {} (PID: {})", process.item.name, pid);
+                        info!(
+                            "Killing existing process {} (PID: {})",
+                            process.item.name, pid
+                        );
                         kill_process(pid);
                     }
                 }
@@ -179,7 +196,7 @@ impl Guardian {
         drop(pending);
 
         info!("Processing {} pending changes", changes.len());
-        
+
         for change in changes {
             self.apply_change(change);
         }
@@ -189,7 +206,10 @@ impl Guardian {
         let mut processes = self.processes.lock().unwrap();
         let mut config = self.config.lock().unwrap();
 
-        info!("Applying change for item: {} (type: {:?})", change.item.id, change.change_type);
+        info!(
+            "Applying change for item: {} (type: {:?})",
+            change.item.id, change.change_type
+        );
 
         if change.change_type.has_flag(ChangeType::Stop) {
             if let Some(process) = processes.get(&change.item.id) {
@@ -200,11 +220,31 @@ impl Guardian {
                     }
                 }
             }
+
+            if let Some(process) = processes.get_mut(&change.item.id) {
+                process.item.enabled = false;
+                info!(
+                    "Disabled monitor item in runtime: {} ({})",
+                    process.item.name, change.item.id
+                );
+            }
+
+            if let Some(item) = config.items.iter_mut().find(|i| i.id == change.item.id) {
+                item.enabled = false;
+                if let Err(e) = crate::config::save_config(&config) {
+                    error!("Failed to save config after stop: {}", e);
+                } else {
+                    info!("Saved config with disabled item: {}", change.item.id);
+                }
+            }
         }
 
         if change.change_type.has_flag(ChangeType::Remove) {
             if let Some(process) = processes.remove(&change.item.id) {
-                info!("Removed monitor item from runtime: {} ({})", process.item.name, change.item.id);
+                info!(
+                    "Removed monitor item from runtime: {} ({})",
+                    process.item.name, change.item.id
+                );
             }
             config.items.retain(|i| i.id != change.item.id);
             if let Err(e) = crate::config::save_config(&config) {
@@ -215,20 +255,30 @@ impl Guardian {
 
         if change.change_type.has_flag(ChangeType::Start) {
             let mut monitored = MonitoredProcess::from_item(change.item.clone());
-            
+
             if let Err(e) = self.start_process_internal(&mut monitored) {
                 error!("Failed to start process {}: {}", change.item.name, e);
             } else {
                 processes.insert(change.item.id.clone(), monitored);
-                
-                if !config.items.iter().any(|i| i.id == change.item.id) {
+
+                if let Some(item) = config.items.iter_mut().find(|i| i.id == change.item.id) {
+                    item.enabled = true;
+                    if let Err(e) = crate::config::save_config(&config) {
+                        error!("Failed to save config after start: {}", e);
+                    } else {
+                        info!("Saved config with enabled item: {}", change.item.id);
+                    }
+                } else {
                     config.items.push(change.item.clone());
                     if let Err(e) = crate::config::save_config(&config) {
                         error!("Failed to save config after add: {}", e);
                     }
                 }
-                
-                info!("Started monitoring: {} ({})", change.item.name, change.item.id);
+
+                info!(
+                    "Started monitoring: {} ({})",
+                    change.item.name, change.item.id
+                );
             }
         }
     }
@@ -239,9 +289,9 @@ impl Guardian {
 
     fn start_process_internal(&self, process: &mut MonitoredProcess) -> Result<(), String> {
         let exe_path = &process.item.exe_path;
-        
+
         info!("Starting process: {}", exe_path);
-        
+
         if !std::path::Path::new(exe_path).exists() {
             error!("Executable not found: {}", exe_path);
             return Err(format!("Executable not found: {}", exe_path));
@@ -273,7 +323,7 @@ impl Guardian {
 
         process.process_id = Some(proc_info.process_id);
         process.last_heartbeat = Instant::now();
-        
+
         info!(
             "Process started successfully: {} (PID: {})",
             process.item.name, proc_info.process_id
