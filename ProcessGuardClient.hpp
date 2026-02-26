@@ -130,7 +130,7 @@ namespace ProcessGuard
         bool ResumeSelfMonitor();
         void SetSelfMonitorId(const std::string &id);
         std::string GetSelfMonitorId() const;
-        void StartSelfHeartbeat(int intervalMs = 500);
+        bool StartSelfHeartbeat(int intervalMs = 500);
         void StopSelfHeartbeat();
 
     private:

@@ -1039,13 +1039,14 @@ namespace ProcessGuard
         return ResumeMonitorItem(impl_->selfMonitorId);
     }
 
-    void Client::StartSelfHeartbeat(int intervalMs)
+    bool Client::StartSelfHeartbeat(int intervalMs)
     {
         if (impl_->selfMonitorId.empty())
         {
-            return;
+            return false;
         }
         StartHeartbeatThread(impl_->selfMonitorId, intervalMs);
+        return true;
     }
 
     void Client::SetSelfMonitorId(const std::string &id)
