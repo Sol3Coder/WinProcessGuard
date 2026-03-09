@@ -1,15 +1,16 @@
 use crate::guardian::Guardian;
 use crate::models::SERVICE_NAME;
 use crate::pipe_server::PipeServer;
-use log::{error, info, LevelFilter};
-use simplelog::{ConfigBuilder, WriteLogger};
+use log::{error, info, LevelFilter, Log, Metadata, Record};
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::macros::offset;
+use time::OffsetDateTime;
 use windows_service::define_windows_service;
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
@@ -18,37 +19,221 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-fn get_log_file_path() -> PathBuf {
+const MAX_LOG_SIZE: u64 = 300 * 1024 * 1024; // 300MB
+const LOG_DIR_NAME: &str = "logs";
+
+/// 获取日志目录路径
+fn get_log_dir() -> PathBuf {
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
-    exe_dir.join("process-guard-service.log")
+    exe_dir.join(LOG_DIR_NAME)
+}
+
+/// 根据日期获取日志文件路径
+fn get_log_file_path(date: &OffsetDateTime) -> PathBuf {
+    let log_dir = get_log_dir();
+    let date_str = date.format(time::macros::format_description!(
+        "[year]-[month]-[day]"
+    )).unwrap_or_else(|_| "unknown".to_string());
+    log_dir.join(format!("process-guard-service-{}.log", date_str))
+}
+
+/// 计算日志目录总大小
+fn get_total_log_size(log_dir: &Path) -> u64 {
+    if !log_dir.exists() {
+        return 0;
+    }
+
+    let mut total_size = 0u64;
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    total_size += metadata.len();
+                }
+            }
+        }
+    }
+    total_size
+}
+
+/// 清理旧的日志文件，直到总大小低于限制
+fn cleanup_old_logs(log_dir: &Path, max_size: u64) {
+    let mut total_size = get_total_log_size(log_dir);
+
+    if total_size <= max_size {
+        return;
+    }
+
+    // 收集所有日志文件及其修改时间
+    let mut log_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    if let Ok(modified) = metadata.modified() {
+                        log_files.push((path, modified));
+                    }
+                }
+            }
+        }
+    }
+
+    // 按修改时间排序（最老的在前）
+    log_files.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // 删除最老的文件直到低于限制
+    for (path, _) in log_files {
+        if total_size <= max_size {
+            break;
+        }
+
+        if let Ok(metadata) = fs::metadata(&path) {
+            let file_size = metadata.len();
+            if fs::remove_file(&path).is_ok() {
+                total_size -= file_size;
+                eprintln!("已删除旧日志文件: {:?}", path);
+            }
+        }
+    }
+}
+
+/// 自定义日志实现，支持按日期分割和容量控制
+struct RotatingLogger {
+    level: LevelFilter,
+    log_dir: PathBuf,
+    current_date: Mutex<OffsetDateTime>,
+    file: Mutex<Option<File>>,
+}
+
+impl RotatingLogger {
+    fn new(level: LevelFilter) -> Self {
+        let log_dir = get_log_dir();
+
+        // 创建日志目录
+        if let Err(e) = fs::create_dir_all(&log_dir) {
+            eprintln!("创建日志目录失败: {:?}", e);
+        }
+
+        // 清理旧日志
+        cleanup_old_logs(&log_dir, MAX_LOG_SIZE);
+
+        let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
+        let log_path = get_log_file_path(&now);
+
+        // 打开或创建日志文件
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok();
+
+        if file.is_some() {
+            eprintln!("日志文件已打开: {:?}", log_path);
+        } else {
+            eprintln!("无法打开日志文件: {:?}", log_path);
+        }
+
+        Self {
+            level,
+            log_dir,
+            current_date: Mutex::new(now),
+            file: Mutex::new(file),
+        }
+    }
+
+    /// 检查是否需要轮转（跨天）
+    fn check_and_rotate(&self) {
+        let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
+        let current_date = *self.current_date.lock().unwrap();
+
+        // 检查是否跨天
+        if now.date() != current_date.date() {
+            let new_log_path = get_log_file_path(&now);
+
+            // 尝试打开新文件
+            if let Ok(new_file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&new_log_path)
+            {
+                let mut file_guard = self.file.lock().unwrap();
+                *file_guard = Some(new_file);
+
+                let mut date_guard = self.current_date.lock().unwrap();
+                *date_guard = now;
+
+                eprintln!("日志已轮转至新文件: {:?}", new_log_path);
+            }
+        }
+
+        // 检查容量限制
+        cleanup_old_logs(&self.log_dir, MAX_LOG_SIZE);
+    }
+
+    /// 格式化日志记录
+    fn format_log(&self, record: &Record) -> String {
+        let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
+        let time_str = now
+            .format(time::macros::format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second]"
+            ))
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        format!(
+            "[{}] [{}] {}\n",
+            time_str,
+            record.level(),
+            record.args()
+        )
+    }
+}
+
+impl Log for RotatingLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= self.level
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        // 检查是否需要轮转
+        self.check_and_rotate();
+
+        let log_line = self.format_log(record);
+
+        // 写入文件
+        if let Ok(mut file_guard) = self.file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                let _ = file.write_all(log_line.as_bytes());
+                let _ = file.flush();
+            }
+        }
+
+        // 同时输出到控制台（用于调试）
+        eprintln!("{}", log_line.trim());
+    }
+
+    fn flush(&self) {
+        if let Ok(mut file_guard) = self.file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                let _ = file.flush();
+            }
+        }
+    }
 }
 
 fn init_logger() {
-    let log_path = get_log_file_path();
+    let logger = RotatingLogger::new(LevelFilter::Debug);
 
-    if let Some(parent) = log_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    // 使用追加模式打开日志文件
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(file) => {
-            // 配置日志时间格式为北京时间 (UTC+8)
-            let config = ConfigBuilder::new()
-                .set_time_offset(offset!(+8))
-                .build();
-            
-            let _ = WriteLogger::init(LevelFilter::Debug, config, file);
-            info!("日志初始化完成, 日志文件: {:?}", log_path);
-        }
-        Err(e) => {
-            eprintln!("创建日志文件失败: {:?}", e);
-        }
+    if log::set_boxed_logger(Box::new(logger)).is_ok() {
+        log::set_max_level(LevelFilter::Debug);
+        info!("日志初始化完成, 日志目录: {:?}", get_log_dir());
+    } else {
+        eprintln!("日志初始化失败");
     }
 }
 
