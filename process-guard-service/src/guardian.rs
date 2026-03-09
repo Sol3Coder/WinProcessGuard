@@ -130,7 +130,8 @@ impl Guardian {
                     "启动被监控程序: {} ({})",
                     process.item.name, process.item.exe_path
                 );
-                if let Err(e) = self.start_process(&mut process) {
+                // 启动进程，如果已存在则复用
+                if let Err(e) = self.start_process_internal(&mut process) {
                     error!("启动被监控程序 {} 失败: {}", process.item.name, e);
                 } else {
                     let mut procs = self.processes.lock().unwrap();
@@ -227,6 +228,7 @@ impl Guardian {
                     }
                 }
 
+                // 重启进程，如果已存在则复用
                 if let Err(e) = self.start_process_internal(process) {
                     error!("重启进程 {} 失败: {}", process.item.name, e);
                 } else {
@@ -319,6 +321,7 @@ impl Guardian {
         if change.change_type.has_flag(ChangeType::Start) {
             let mut monitored = MonitoredProcess::from_item(change.item.clone());
 
+            // 启动进程，如果已存在则复用
             if let Err(e) = self.start_process_internal(&mut monitored) {
                 error!("启动进程 {} 失败: {}", change.item.name, e);
             } else {
@@ -360,17 +363,16 @@ impl Guardian {
             return Err(format!("可执行文件未找到: {}", exe_path));
         }
 
+        // 检查是否已有同名进程在运行，如果存在则复用
         if let Some(existing_pid) = find_process_by_path(exe_path) {
-            warn!(
-                "进程已在运行 (PID: {}), 重启前终止",
-                existing_pid
-            );
             info!(
-                "退出被监控程序: {}, PID: {}, 原因: 重启前清理",
+                "发现进程 {} 已在运行 (PID: {}), 复用该进程",
                 process.item.name, existing_pid
             );
-            kill_process(existing_pid);
-            std::thread::sleep(Duration::from_millis(500));
+            process.process_id = Some(existing_pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now(); // 记录进程启动时间
+            return Ok(());
         }
 
         let working_dir = std::path::Path::new(exe_path)
@@ -390,7 +392,7 @@ impl Guardian {
 
         process.process_id = Some(proc_info.process_id);
         process.last_heartbeat = Instant::now();
-        process.startup_time = Instant::now();  // 记录进程启动时间
+        process.startup_time = Instant::now(); // 记录进程启动时间
 
         info!(
             "启动被监控程序: {}, PID: {}",
