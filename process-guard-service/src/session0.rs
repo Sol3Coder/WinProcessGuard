@@ -115,7 +115,7 @@ fn get_active_session_id() -> u32 {
     unsafe {
         let session_id = WTSGetActiveConsoleSessionId();
         if session_id != 0xFFFFFFFF {
-            debug!("Active console session ID: {}", session_id);
+            debug!("活动控制台会话ID: {}", session_id);
             return session_id;
         }
 
@@ -130,14 +130,14 @@ fn get_active_session_id() -> u32 {
                 if session.state == WTS_CONNECTSTATE_CLASS::WTSActive {
                     let active_id = session.session_id;
                     WTSFreeMemory(session_info as *mut std::ffi::c_void);
-                    debug!("Found active session via enumeration: {}", active_id);
+                    debug!("通过枚举找到活动会话: {}", active_id);
                     return active_id;
                 }
             }
             WTSFreeMemory(session_info as *mut std::ffi::c_void);
         }
 
-        error!("Failed to get active session ID");
+        error!("获取活动会话ID失败");
         0xFFFFFFFF
     }
 }
@@ -157,16 +157,16 @@ pub fn start_process_in_session0(
 
         let session_id = get_active_session_id();
         if session_id == 0xFFFFFFFF {
-            return Err("Failed to get active session ID".to_string());
+            return Err("获取活动会话ID失败".to_string());
         }
 
-        info!("Starting process in session {}, path: {}", session_id, exe_path);
+        info!("正在会话 {} 中启动进程, 路径: {}", session_id, exe_path);
 
         let query_result = WTSQueryUserToken(session_id, &mut h_token);
         if query_result == 0 {
             let err = windows::core::Error::from_win32();
-            error!("WTSQueryUserToken failed: {:?}", err);
-            return Err(format!("WTSQueryUserToken failed: {:?}", err));
+            error!("WTSQueryUserToken 失败: {:?}", err);
+            return Err(format!("WTSQueryUserToken 失败: {:?}", err));
         }
 
         let dup_result = DuplicateTokenEx(
@@ -181,16 +181,16 @@ pub fn start_process_in_session0(
         if dup_result == 0 {
             let err = windows::core::Error::from_win32();
             let _ = CloseHandle(h_token);
-            error!("DuplicateTokenEx failed: {:?}", err);
-            return Err(format!("DuplicateTokenEx failed: {:?}", err));
+            error!("DuplicateTokenEx 失败: {:?}", err);
+            return Err(format!("DuplicateTokenEx 失败: {:?}", err));
         }
 
         let env_result = CreateEnvironmentBlock(&mut p_env, h_dup_token, false);
         if env_result == 0 {
             let _ = CloseHandle(h_token);
             let _ = CloseHandle(h_dup_token);
-            error!("CreateEnvironmentBlock failed");
-            return Err("CreateEnvironmentBlock failed".to_string());
+            error!("CreateEnvironmentBlock 失败");
+            return Err("CreateEnvironmentBlock 失败".to_string());
         }
 
         let mut startup_info: STARTUPINFOW = std::mem::zeroed();
@@ -247,8 +247,8 @@ pub fn start_process_in_session0(
 
         if create_result.is_err() {
             let err = windows::core::Error::from_win32();
-            error!("CreateProcessAsUserW failed: {:?}", err);
-            return Err(format!("CreateProcessAsUserW failed: {:?}", err));
+            error!("CreateProcessAsUserW 失败: {:?}", err);
+            return Err(format!("CreateProcessAsUserW 失败: {:?}", err));
         }
 
         process_info.process_id = proc_info.dwProcessId;
@@ -257,7 +257,7 @@ pub fn start_process_in_session0(
         process_info.thread_handle = proc_info.hThread;
 
         info!(
-            "Started process in session 0: {} (PID: {})",
+            "已在会话0中启动进程: {} (PID: {})",
             exe_path, process_info.process_id
         );
 
@@ -293,19 +293,19 @@ pub fn kill_process(process_id: u32) -> bool {
         return true;
     }
 
-    info!("Killing process with PID: {}", process_id);
+    info!("正在终止进程, PID: {}", process_id);
 
     unsafe {
         let handle = match OpenProcess(PROCESS_TERMINATE, false, process_id) {
             Ok(h) => h,
             Err(_) => {
-                debug!("Process {} not found or already terminated", process_id);
+                debug!("进程 {} 未找到或已终止", process_id);
                 return true;
             }
         };
 
         if handle.is_invalid() {
-            debug!("Process {} not found or already terminated", process_id);
+            debug!("进程 {} 未找到或已终止", process_id);
             return true;
         }
 
@@ -313,7 +313,7 @@ pub fn kill_process(process_id: u32) -> bool {
         let _ = CloseHandle(handle);
 
         if result.is_ok() {
-            info!("Process {} terminated successfully", process_id);
+            info!("进程 {} 终止成功", process_id);
         }
         
         result.is_ok()
@@ -326,7 +326,7 @@ pub fn find_process_by_name(process_name: &str) -> Option<u32> {
         TH32CS_SNAPPROCESS,
     };
 
-    debug!("Searching for process by name: {}", process_name);
+    debug!("正在按名称搜索进程: {}", process_name);
 
     unsafe {
         let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
@@ -355,7 +355,7 @@ pub fn find_process_by_name(process_name: &str) -> Option<u32> {
             {
                 let pid = entry.th32ProcessID;
                 let _ = CloseHandle(snapshot);
-                debug!("Found process {} with PID: {}", process_name, pid);
+                debug!("找到进程 {} , PID: {}", process_name, pid);
                 return Some(pid);
             }
 
@@ -363,7 +363,7 @@ pub fn find_process_by_name(process_name: &str) -> Option<u32> {
         }
 
         let _ = CloseHandle(snapshot);
-        debug!("Process {} not found", process_name);
+        debug!("未找到进程 {}", process_name);
         None
     }
 }
@@ -375,7 +375,7 @@ pub fn find_process_by_path(exe_path: &str) -> Option<u32> {
     };
     use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
 
-    debug!("Searching for process by path: {}", exe_path);
+    debug!("正在按路径搜索进程: {}", exe_path);
 
     unsafe {
         let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
@@ -411,7 +411,7 @@ pub fn find_process_by_path(exe_path: &str) -> Option<u32> {
                         if path.to_lowercase() == target_path {
                             let pid = entry.th32ProcessID;
                             let _ = CloseHandle(snapshot);
-                            debug!("Found process at {} with PID: {}", exe_path, pid);
+                            debug!("找到路径为 {} 的进程, PID: {}", exe_path, pid);
                             return Some(pid);
                         }
                     }
@@ -422,7 +422,7 @@ pub fn find_process_by_path(exe_path: &str) -> Option<u32> {
         }
 
         let _ = CloseHandle(snapshot);
-        debug!("Process at path {} not found", exe_path);
+        debug!("未找到路径为 {} 的进程", exe_path);
         None
     }
 }

@@ -1,44 +1,44 @@
 # WinProcessGuard
 
-vibecoding 的windows下进程守护，服务端为rust 编写的windows 服务， 客户端是cpp类，集成到cpp程序中完成进程守护（自监控），也可以自行完成GUI部分实现对任意进程的守护。  
-只进行过少量的功能测试，确认了在我的环境下正常运行，在你的环境下使用前请自行测试
+Windows 下的进程守护工具，采用服务端-客户端架构。服务端为 Rust 编写的 Windows 服务，负责实际的进程监控和守护；客户端为 C++ 类库，可集成到第三方程序中实现进程自监控，也可用于构建 GUI 管理界面。
 
-```cpp
-    std::string servicePath = ProcessGuard::Client::GetCurrentExeDir() + "\\processguard\\process-guard-service.exe";
-    SPDLOG_INFO("服务安装状态:{}", (m_client.IsServiceInstalled() ? "是" : "否"));
-    SPDLOG_INFO("服务运行状态:{}", (m_client.IsServiceRunning() ? "是" : "否"));
-    if (!m_client.QuickSetup(servicePath))
-    {
-        SPDLOG_INFO("服务设置失败: {}", m_client.GetLastError());
-        return;
-    }
+> ⚠️ **注意**：本项目仅进行过少量功能测试，请在生产环境使用前自行充分测试。
 
-    auto items = m_client.GetAllMonitorItems();
-    SPDLOG_INFO("获取配置项个数{}", items.size());
-    if (items.empty())
-    {
-        SPDLOG_INFO("添加自配制，守护自身");
-        m_client.AddSelfMonitor("YouAppLication", 3000);
-        SPDLOG_INFO("添加自配制完成");
-    }
+---
 
-    for (const auto &item : items)
-    {
-        SPDLOG_INFO("监控项名称:{}, id:{}", item.name, item.id);
-        SPDLOG_INFO("监控项路径:{}", item.exePath);
-        SPDLOG_INFO("监控项启用状态:{}", (item.enabled ? "是" : "否"));
+## 目录
 
-        if (item.name == "YouAppLication")
-        {
-            m_client.SetSelfMonitorId(item.id);
-            if (!item.enabled)
-            {
-                m_client.ResumeMonitorItem(item.id);
-            }
-        }
-    }
-SPDLOG_INFO("启动心跳，启动结果:{}", m_client.StartSelfHeartbeat(500));
-```*通信**：Windows 命名管道（Named Pipe）+ JSON 协议
+- [架构概述](#架构概述)
+- [服务端架构](#服务端架构)
+- [客户端 API](#客户端-api)
+- [配置文件](#配置文件)
+- [快速开始](#快速开始)
+- [使用示例](#使用示例)
+
+---
+
+## 架构概述
+
+```
+┌─────────────────┐      命名管道通信       ┌──────────────────┐
+│   C++ Client    │  ◄──────────────────►  │  Rust Service    │
+│  (ProcessGuard  │   \\.\pipe\ProcessGuard │ (Windows Service)│
+│   ::Client)     │                        │                  │
+└─────────────────┘                        └────────┬─────────┘
+                                                    │
+                                                    │ 进程管理
+                                                    ▼
+                                           ┌──────────────────┐
+                                           │  被监控的进程    │
+                                           │  (自动重启)      │
+                                           └──────────────────┘
+```
+
+### 技术栈
+
+- **服务端**：Rust + Windows Service API + Windows Crate
+- **客户端**：C++17 + Windows API + nlohmann/json
+- **通信**：Windows 命名管道（Named Pipe）+ JSON 协议
 
 ---
 

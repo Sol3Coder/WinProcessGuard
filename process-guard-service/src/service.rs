@@ -2,13 +2,14 @@ use crate::guardian::Guardian;
 use crate::models::SERVICE_NAME;
 use crate::pipe_server::PipeServer;
 use log::{error, info, LevelFilter};
-use simplelog::{Config as LogConfig, WriteLogger};
+use simplelog::{ConfigBuilder, WriteLogger};
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use time::macros::offset;
 use windows_service::define_windows_service;
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
@@ -30,13 +31,23 @@ fn init_logger() {
         let _ = fs::create_dir_all(parent);
     }
 
-    match File::create(&log_path) {
+    // 使用追加模式打开日志文件
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         Ok(file) => {
-            let _ = WriteLogger::init(LevelFilter::Debug, LogConfig::default(), file);
-            info!("Logger initialized, log file: {:?}", log_path);
+            // 配置日志时间格式为北京时间 (UTC+8)
+            let config = ConfigBuilder::new()
+                .set_time_offset(offset!(+8))
+                .build();
+            
+            let _ = WriteLogger::init(LevelFilter::Debug, config, file);
+            info!("日志初始化完成, 日志文件: {:?}", log_path);
         }
         Err(e) => {
-            eprintln!("Failed to create log file: {:?}", e);
+            eprintln!("创建日志文件失败: {:?}", e);
         }
     }
 }
@@ -46,7 +57,7 @@ define_windows_service!(ffi_service_main, service_main);
 fn service_main(_arguments: Vec<OsString>) {
     init_logger();
     info!("========================================");
-    info!("Process Guard Service starting...");
+    info!("进程守护服务启动...");
     info!("========================================");
 
     let running = Arc::new(Mutex::new(true));
@@ -57,7 +68,7 @@ fn service_main(_arguments: Vec<OsString>) {
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
-                info!("Received stop signal from service control manager");
+                info!("接收到服务控制管理器的停止信号");
                 let mut running = running_clone.lock().unwrap();
                 *running = false;
                 ServiceControlHandlerResult::NoError
@@ -68,7 +79,7 @@ fn service_main(_arguments: Vec<OsString>) {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
-        .expect("Failed to register service control handler");
+        .expect("注册服务控制处理器失败");
 
     let _ = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -80,37 +91,37 @@ fn service_main(_arguments: Vec<OsString>) {
         process_id: None,
     });
 
-    info!("Service status set to RUNNING");
+    info!("服务状态已设置为运行中");
 
     let guardian = Arc::new(Guardian::new(running_for_guardian));
     let guardian_for_pipe = guardian.clone();
 
     let guardian_handle = std::thread::spawn(move || {
-        info!("Guardian thread started, entering run loop");
+        info!("守护线程已启动, 进入运行循环");
         guardian.run();
-        info!("Guardian thread exited");
+        info!("守护线程已退出");
     });
 
     let pipe_server = PipeServer::new(guardian_for_pipe, running_for_pipe);
     let pipe_handle = std::thread::spawn(move || {
-        info!("Pipe server thread started");
+        info!("管道服务线程已启动");
         pipe_server.run();
-        info!("Pipe server thread exited");
+        info!("管道服务线程已退出");
     });
 
-    info!("Service is now running and monitoring processes");
+    info!("服务正在运行并监控进程中");
 
     loop {
         let r = running.lock().unwrap();
         if !*r {
-            info!("Service main loop received stop signal");
+            info!("服务主循环接收到停止信号");
             break;
         }
         drop(r);
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    info!("Service stopping...");
+    info!("服务正在停止...");
 
     let _ = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -126,7 +137,7 @@ fn service_main(_arguments: Vec<OsString>) {
     let _ = pipe_handle.join();
 
     info!("========================================");
-    info!("Process Guard Service stopped");
+    info!("进程守护服务已停止");
     info!("========================================");
 }
 
@@ -135,13 +146,13 @@ pub fn run_service() -> Result<(), windows_service::Error> {
 }
 
 pub fn install_service(exe_path: &str) -> Result<(), String> {
-    info!("Installing service from: {}", exe_path);
+    info!("正在安装服务: {}", exe_path);
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager =
         ServiceManager::local_computer(None::<&str>, manager_access).map_err(|e| {
-            error!("Failed to connect to service manager: {:?}", e);
-            format!("Failed to connect to service manager: {:?}", e)
+            error!("连接服务管理器失败: {:?}", e);
+            format!("连接服务管理器失败: {:?}", e)
         })?;
 
     let service_info = ServiceInfo {
@@ -160,107 +171,107 @@ pub fn install_service(exe_path: &str) -> Result<(), String> {
     service_manager
         .create_service(&service_info, ServiceAccess::empty())
         .map_err(|e| {
-            error!("Failed to create service: {:?}", e);
-            format!("Failed to create service: {:?}", e)
+            error!("创建服务失败: {:?}", e);
+            format!("创建服务失败: {:?}", e)
         })?;
 
-    info!("Service installed successfully");
+    info!("服务安装成功");
     Ok(())
 }
 
 pub fn uninstall_service() -> Result<(), String> {
-    info!("Uninstalling service");
+    info!("正在卸载服务");
 
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager =
         ServiceManager::local_computer(None::<&str>, manager_access).map_err(|e| {
-            error!("Failed to connect to service manager: {:?}", e);
-            format!("Failed to connect to service manager: {:?}", e)
+            error!("连接服务管理器失败: {:?}", e);
+            format!("连接服务管理器失败: {:?}", e)
         })?;
 
     let service_access = ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS;
     let service = service_manager
         .open_service(SERVICE_NAME, service_access)
         .map_err(|e| {
-            error!("Failed to open service: {:?}", e);
-            format!("Failed to open service: {:?}", e)
+            error!("打开服务失败: {:?}", e);
+            format!("打开服务失败: {:?}", e)
         })?;
 
     let status = service.query_status().map_err(|e| {
-        error!("Failed to query service status: {:?}", e);
-        format!("Failed to query service status: {:?}", e)
+        error!("查询服务状态失败: {:?}", e);
+        format!("查询服务状态失败: {:?}", e)
     })?;
 
     if status.current_state == ServiceState::Running {
-        info!("Service is running, stopping it first");
+        info!("服务正在运行, 先停止服务");
         service.stop().map_err(|e| {
-            error!("Failed to stop service: {:?}", e);
-            format!("Failed to stop service: {:?}", e)
+            error!("停止服务失败: {:?}", e);
+            format!("停止服务失败: {:?}", e)
         })?;
 
         std::thread::sleep(Duration::from_secs(2));
     }
 
     service.delete().map_err(|e| {
-        error!("Failed to delete service: {:?}", e);
-        format!("Failed to delete service: {:?}", e)
+        error!("删除服务失败: {:?}", e);
+        format!("删除服务失败: {:?}", e)
     })?;
 
-    info!("Service uninstalled successfully");
+    info!("服务卸载成功");
     Ok(())
 }
 
 pub fn start_service() -> Result<(), String> {
-    info!("Starting service");
+    info!("正在启动服务");
 
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager =
         ServiceManager::local_computer(None::<&str>, manager_access).map_err(|e| {
-            error!("Failed to connect to service manager: {:?}", e);
-            format!("Failed to connect to service manager: {:?}", e)
+            error!("连接服务管理器失败: {:?}", e);
+            format!("连接服务管理器失败: {:?}", e)
         })?;
 
     let service_access = ServiceAccess::START | ServiceAccess::QUERY_STATUS;
     let service = service_manager
         .open_service(SERVICE_NAME, service_access)
         .map_err(|e| {
-            error!("Failed to open service: {:?}", e);
-            format!("Failed to open service: {:?}", e)
+            error!("打开服务失败: {:?}", e);
+            format!("打开服务失败: {:?}", e)
         })?;
 
     service.start(&[] as &[OsString]).map_err(|e| {
-        error!("Failed to start service: {:?}", e);
-        format!("Failed to start service: {:?}", e)
+        error!("启动服务失败: {:?}", e);
+        format!("启动服务失败: {:?}", e)
     })?;
 
-    info!("Service started successfully");
+    info!("服务启动成功");
     Ok(())
 }
 
 pub fn stop_service() -> Result<(), String> {
-    info!("Stopping service");
+    info!("正在停止服务");
 
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager =
         ServiceManager::local_computer(None::<&str>, manager_access).map_err(|e| {
-            error!("Failed to connect to service manager: {:?}", e);
-            format!("Failed to connect to service manager: {:?}", e)
+            error!("连接服务管理器失败: {:?}", e);
+            format!("连接服务管理器失败: {:?}", e)
         })?;
 
     let service_access = ServiceAccess::STOP | ServiceAccess::QUERY_STATUS;
     let service = service_manager
         .open_service(SERVICE_NAME, service_access)
         .map_err(|e| {
-            error!("Failed to open service: {:?}", e);
-            format!("Failed to open service: {:?}", e)
+            error!("打开服务失败: {:?}", e);
+            format!("打开服务失败: {:?}", e)
         })?;
 
     service.stop().map_err(|e| {
-        error!("Failed to stop service: {:?}", e);
-        format!("Failed to stop service: {:?}", e)
+        error!("停止服务失败: {:?}", e);
+        format!("停止服务失败: {:?}", e)
     })?;
 
-    info!("Service stopped successfully");
+    info!("服务停止成功");
     Ok(())
 }
 

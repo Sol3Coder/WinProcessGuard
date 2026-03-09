@@ -17,7 +17,7 @@ pub struct MonitorItem {
 }
 
 fn default_heartbeat_timeout() -> u64 {
-    1000
+    10000
 }
 
 impl MonitorItem {
@@ -30,7 +30,7 @@ impl MonitorItem {
             minimize: false,
             no_window: false,
             enabled: true,
-            heartbeat_timeout_ms: 1000,
+            heartbeat_timeout_ms: 10000,
         }
     }
 }
@@ -42,6 +42,7 @@ pub struct MonitoredProcess {
     pub last_heartbeat: Instant,
     pub last_check: Instant,
     pub restart_count: u32,
+    pub startup_time: Instant, // 进程启动时间，用于计算启动宽限期
 }
 
 impl MonitoredProcess {
@@ -52,6 +53,7 @@ impl MonitoredProcess {
             last_heartbeat: Instant::now(),
             last_check: Instant::now(),
             restart_count: 0,
+            startup_time: Instant::now(),
         }
     }
 
@@ -163,4 +165,4 @@ pub const SERVICE_NAME: &str = "ProcessGuardService";
 pub const PIPE_NAME: &str = "ProcessGuardService";
 pub const CONFIG_FILE_NAME: &str = "config.json";
 pub const CHECK_INTERVAL_MS: u64 = 3000;
-pub const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 1000;
+pub const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 10000;
