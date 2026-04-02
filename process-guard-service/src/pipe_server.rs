@@ -68,7 +68,7 @@ impl PipeServer {
                 continue;
             }
 
-            debug!("等待客户端连接...");
+            //  debug!("等待客户端连接...");
 
             let connect_result = unsafe { ConnectNamedPipe(pipe_handle, None) };
 
@@ -83,7 +83,7 @@ impl PipeServer {
                 }
             }
 
-            info!("客户端已连接到管道服务");
+            //   info!("客户端已连接到管道服务");
 
             let mut buffer = vec![0u8; BUFFER_SIZE as usize];
             let mut bytes_read: u32 = 0;
@@ -101,7 +101,7 @@ impl PipeServer {
             }
 
             let request_data = String::from_utf8_lossy(&buffer[..bytes_read as usize]);
-            info!("接收到请求: {}", request_data);
+            //    info!("接收到请求: {}", request_data);
 
             let response = self.handle_request(&request_data);
             let response_data = serde_json::to_string(&response).unwrap_or_default();
@@ -119,7 +119,7 @@ impl PipeServer {
             if write_result.is_err() {
                 error!("向管道写入响应失败");
             } else {
-                debug!("响应已发送: {}", response_data);
+                // debug!("响应已发送: {}", response_data);
             }
 
             unsafe {
@@ -127,7 +127,7 @@ impl PipeServer {
                 let _ = CloseHandle(pipe_handle);
             }
 
-            info!("客户端已从管道服务断开");
+            //  info!("客户端已从管道服务断开");
         }
 
         info!("管道服务已停止");
@@ -142,7 +142,7 @@ impl PipeServer {
             }
         };
 
-        info!("正在处理请求类型: {}", request.request_type);
+        //  info!("正在处理请求类型: {}", request.request_type);
 
         match request.request_type.as_str() {
             "heartbeat" => self.handle_heartbeat(&request),
@@ -160,7 +160,7 @@ impl PipeServer {
     fn handle_heartbeat(&self, request: &PipeRequest) -> PipeResponse {
         if let Some(item_id) = &request.item_id {
             if self.guardian.update_heartbeat(item_id) {
-                debug!("监控项心跳已更新: {}", item_id);
+                //    debug!("监控项心跳已更新: {}", item_id);
                 PipeResponse::success("心跳已更新")
             } else {
                 error!("心跳更新失败, 未找到监控项: {}", item_id);
@@ -207,10 +207,7 @@ impl PipeServer {
             };
             self.guardian.add_change(change);
 
-            info!(
-                "监控项添加成功: {} ({})",
-                config.name, config.id
-            );
+            info!("监控项添加成功: {} ({})", config.name, config.id);
             PipeResponse::success("监控项已添加")
         } else {
             PipeResponse::error("缺少配置")
@@ -240,10 +237,7 @@ impl PipeServer {
                 };
                 self.guardian.add_change(change);
 
-                info!(
-                    "监控项更新成功: {} ({})",
-                    config.name, config.id
-                );
+                info!("监控项更新成功: {} ({})", config.name, config.id);
                 PipeResponse::success("监控项已更新")
             } else {
                 error!("未找到要更新的监控项: {}", config.id);
