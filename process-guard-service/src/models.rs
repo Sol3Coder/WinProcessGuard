@@ -164,5 +164,6 @@ pub struct ConfigChange {
 pub const SERVICE_NAME: &str = "ProcessGuardService";
 pub const PIPE_NAME: &str = "ProcessGuardService";
 pub const CONFIG_FILE_NAME: &str = "config.json";
+pub const CONFIG_BACKUP_FILE_NAME: &str = "config_bak.json";
 pub const CHECK_INTERVAL_MS: u64 = 3000;
 pub const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 10000;
