@@ -13,7 +13,17 @@ fn should_kill_process_for_change(change_type: ChangeType) -> bool {
 }
 
 fn normalize_startup_config(config: Config) -> (Config, bool) {
-    (config, false)
+    let mut config = config;
+    let mut modified = false;
+
+    for item in &mut config.items {
+        if !item.enabled {
+            item.enabled = true;
+            modified = true;
+        }
+    }
+
+    (config, modified)
 }
 
 fn apply_pause_state(
@@ -95,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_keeps_disabled_monitor_items_disabled() {
+    fn startup_forces_disabled_monitor_items_enabled() {
         let config = Config {
             items: vec![MonitorItem {
                 id: "EnergyMonitor".to_string(),
@@ -110,8 +120,28 @@ mod tests {
         };
 
         let (normalized, modified) = normalize_startup_config(config);
+        assert!(modified);
+        assert!(normalized.items[0].enabled);
+    }
+
+    #[test]
+    fn startup_leaves_already_enabled_monitor_items_unchanged() {
+        let config = Config {
+            items: vec![MonitorItem {
+                id: "EnergyMonitor".to_string(),
+                exe_path: r"C:\EnergyMonitor.exe".to_string(),
+                args: None,
+                name: "EnergyMonitor".to_string(),
+                minimize: false,
+                no_window: false,
+                enabled: true,
+                heartbeat_timeout_ms: 15_000,
+            }],
+        };
+
+        let (normalized, modified) = normalize_startup_config(config);
         assert!(!modified);
-        assert!(!normalized.items[0].enabled);
+        assert!(normalized.items[0].enabled);
     }
 }
 
