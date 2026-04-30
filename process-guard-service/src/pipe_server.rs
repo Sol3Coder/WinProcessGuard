@@ -7,7 +7,7 @@ use std::sync::Arc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Storage::FileSystem::{
-    ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -29,16 +29,26 @@ fn to_wide_string(s: &str) -> Vec<u16> {
 pub struct PipeServer {
     guardian: Arc<Guardian>,
     running: Arc<std::sync::Mutex<bool>>,
+    ready_signal: Option<Arc<crate::service::StartupGate>>,
 }
 
 impl PipeServer {
-    pub fn new(guardian: Arc<Guardian>, running: Arc<std::sync::Mutex<bool>>) -> Self {
-        Self { guardian, running }
+    pub fn new(
+        guardian: Arc<Guardian>,
+        running: Arc<std::sync::Mutex<bool>>,
+        ready_signal: Option<Arc<crate::service::StartupGate>>,
+    ) -> Self {
+        Self {
+            guardian,
+            running,
+            ready_signal,
+        }
     }
 
     pub fn run(&self) {
         let pipe_name = format!("\\\\.\\pipe\\{}", PIPE_NAME);
         let pipe_name_wide = to_wide_string(&pipe_name);
+        let mut ready_notified = false;
 
         info!("正在启动管道服务: {}", pipe_name);
 
@@ -61,6 +71,13 @@ impl PipeServer {
                     None,
                 )
             };
+
+            if !pipe_handle.is_invalid() && !ready_notified {
+                if let Some(ready_signal) = &self.ready_signal {
+                    ready_signal.mark_ready();
+                }
+                ready_notified = true;
+            }
 
             if pipe_handle.is_invalid() {
                 error!("创建命名管道失败");
@@ -149,6 +166,7 @@ impl PipeServer {
             "add" => self.handle_add(&request),
             "update" => self.handle_update(&request),
             "remove" => self.handle_remove(&request),
+            "pause" => self.handle_pause(&request),
             "stop" => self.handle_stop(&request),
             "start" => self.handle_start(&request),
             "list" => self.handle_list(),
@@ -336,6 +354,33 @@ impl PipeServer {
             }
         } else {
             PipeResponse::error("缺少id")
+        }
+    }
+
+    fn handle_pause(&self, request: &PipeRequest) -> PipeResponse {
+        if let Some(id) = &request.id {
+            info!("姝ｅ湪鏆傚仠鐩戞帶椤? {}", id);
+
+            let config_arc = self.guardian.get_config();
+            let cfg = config_arc.lock().unwrap();
+            let item = cfg.items.iter().find(|i| &i.id == id).cloned();
+            drop(cfg);
+
+            if let Some(item) = item {
+                let change = ConfigChange {
+                    item,
+                    change_type: ChangeType::Pause,
+                };
+                self.guardian.add_change(change);
+
+                info!("鐩戞帶椤规殏鍋滃懡浠ゅ凡鍙戦€? {}", id);
+                PipeResponse::success("鐩戞帶椤瑰凡鏆傚仠")
+            } else {
+                error!("鏈壘鍒拌鏆傚仠鐨勭洃鎺ч」: {}", id);
+                PipeResponse::error("鏈壘鍒扮洃鎺ч」")
+            }
+        } else {
+            PipeResponse::error("缂哄皯id")
         }
     }
 

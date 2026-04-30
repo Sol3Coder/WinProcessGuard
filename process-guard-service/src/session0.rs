@@ -4,6 +4,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, MAX_PATH};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenElevation, TokenElevationType, TokenLinkedToken,
+    TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN,
+};
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetExitCodeProcess, OpenProcess, TerminateProcess,
     CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS,
@@ -111,6 +115,162 @@ fn to_wide_string(s: &str) -> Vec<u16> {
         .collect()
 }
 
+fn describe_token_elevation(token: HANDLE) -> String {
+    unsafe {
+        let mut returned = 0u32;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let elevation_result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+
+        let mut elevation_type = TOKEN_ELEVATION_TYPE(0);
+        let elevation_type_result = GetTokenInformation(
+            token,
+            TokenElevationType,
+            Some((&mut elevation_type as *mut TOKEN_ELEVATION_TYPE).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut returned,
+        );
+
+        let elevated = if elevation_result.is_ok() {
+            if elevation.TokenIsElevated != 0 {
+                "elevated"
+            } else {
+                "not-elevated"
+            }
+        } else {
+            "elevation-query-failed"
+        };
+
+        let elevation_type_name = if elevation_type_result.is_ok() {
+            match elevation_type.0 {
+                1 => "default",
+                2 => "full",
+                3 => "limited",
+                _ => "unknown",
+            }
+        } else {
+            "type-query-failed"
+        };
+
+        format!("{}, type={}", elevated, elevation_type_name)
+    }
+}
+
+fn should_prefer_linked_token(elevated: bool, elevation_type_raw: i32) -> bool {
+    !elevated && elevation_type_raw == 3
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenLaunchSource {
+    Original,
+    Linked,
+}
+
+fn choose_token_launch_source(
+    elevated: bool,
+    elevation_type_raw: i32,
+    linked_token_available: bool,
+) -> TokenLaunchSource {
+    if should_prefer_linked_token(elevated, elevation_type_raw) && linked_token_available {
+        TokenLaunchSource::Linked
+    } else {
+        TokenLaunchSource::Original
+    }
+}
+
+fn read_token_elevation_state(token: HANDLE) -> (bool, i32) {
+    unsafe {
+        let mut returned = 0u32;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let elevation_result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+
+        let mut elevation_type = TOKEN_ELEVATION_TYPE(0);
+        let elevation_type_result = GetTokenInformation(
+            token,
+            TokenElevationType,
+            Some((&mut elevation_type as *mut TOKEN_ELEVATION_TYPE).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut returned,
+        );
+
+        let elevated = elevation_result.is_ok() && elevation.TokenIsElevated != 0;
+        let elevation_type_raw = if elevation_type_result.is_ok() {
+            elevation_type.0
+        } else {
+            0
+        };
+
+        (elevated, elevation_type_raw)
+    }
+}
+
+fn try_get_linked_token(token: HANDLE) -> Option<HANDLE> {
+    unsafe {
+        let mut returned = 0u32;
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let result = GetTokenInformation(
+            token,
+            TokenLinkedToken,
+            Some((&mut linked as *mut TOKEN_LINKED_TOKEN).cast()),
+            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            &mut returned,
+        );
+
+        if result.is_ok() && !linked.LinkedToken.is_invalid() {
+            Some(linked.LinkedToken)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_prefer_linked_token, TokenLaunchSource, choose_token_launch_source};
+
+    #[test]
+    fn prefers_linked_token_for_limited_non_elevated_admin_token() {
+        assert!(should_prefer_linked_token(false, 3));
+    }
+
+    #[test]
+    fn does_not_prefer_linked_token_for_full_elevated_token() {
+        assert!(!should_prefer_linked_token(true, 2));
+    }
+
+    #[test]
+    fn does_not_prefer_linked_token_for_default_token_type() {
+        assert!(!should_prefer_linked_token(false, 1));
+    }
+
+    #[test]
+    fn chooses_linked_launch_source_for_limited_token_when_linked_token_exists() {
+        assert_eq!(
+            choose_token_launch_source(false, 3, true),
+            TokenLaunchSource::Linked
+        );
+    }
+
+    #[test]
+    fn falls_back_to_original_launch_source_when_linked_token_is_missing() {
+        assert_eq!(
+            choose_token_launch_source(false, 3, false),
+            TokenLaunchSource::Original
+        );
+    }
+}
+
 fn get_active_session_id() -> u32 {
     unsafe {
         let session_id = WTSGetActiveConsoleSessionId();
@@ -152,6 +312,7 @@ pub fn start_process_in_session0(
     unsafe {
         let mut process_info = ProcessInfo::new();
         let mut h_token = HANDLE::default();
+        let mut h_linked_token = HANDLE::default();
         let mut h_dup_token = HANDLE::default();
         let mut p_env: *mut std::ffi::c_void = ptr::null_mut();
 
@@ -168,9 +329,42 @@ pub fn start_process_in_session0(
             error!("WTSQueryUserToken 失败: {:?}", err);
             return Err(format!("WTSQueryUserToken 失败: {:?}", err));
         }
+        info!("Session {} user token diagnostics before duplication: {}", session_id, describe_token_elevation(h_token));
+
+        let (is_elevated, elevation_type_raw) = read_token_elevation_state(h_token);
+        let linked_token = if should_prefer_linked_token(is_elevated, elevation_type_raw) {
+            try_get_linked_token(h_token)
+        } else {
+            None
+        };
+        let launch_source = choose_token_launch_source(
+            is_elevated,
+            elevation_type_raw,
+            linked_token.is_some(),
+        );
+        let duplicate_source_token = match launch_source {
+            TokenLaunchSource::Linked => {
+                h_linked_token = linked_token.expect("linked token should exist for linked launch source");
+                info!(
+                    "Session {} using linked elevated token for process launch: {}",
+                    session_id,
+                    describe_token_elevation(h_linked_token)
+                );
+                h_linked_token
+            }
+            TokenLaunchSource::Original => {
+                if should_prefer_linked_token(is_elevated, elevation_type_raw) {
+                    info!(
+                        "Session {} token is limited but linked token is unavailable; falling back to original token",
+                        session_id
+                    );
+                }
+                h_token
+            }
+        };
 
         let dup_result = DuplicateTokenEx(
-            h_token,
+            duplicate_source_token,
             MAXIMUM_ALLOWED,
             ptr::null_mut(),
             SECURITY_IDENTIFICATION,
@@ -181,13 +375,20 @@ pub fn start_process_in_session0(
         if dup_result == 0 {
             let err = windows::core::Error::from_win32();
             let _ = CloseHandle(h_token);
+            if !h_linked_token.is_invalid() {
+                let _ = CloseHandle(h_linked_token);
+            }
             error!("DuplicateTokenEx 失败: {:?}", err);
             return Err(format!("DuplicateTokenEx 失败: {:?}", err));
         }
+        info!("Session {} duplicated primary token diagnostics: {}", session_id, describe_token_elevation(h_dup_token));
 
         let env_result = CreateEnvironmentBlock(&mut p_env, h_dup_token, false);
         if env_result == 0 {
             let _ = CloseHandle(h_token);
+            if !h_linked_token.is_invalid() {
+                let _ = CloseHandle(h_linked_token);
+            }
             let _ = CloseHandle(h_dup_token);
             error!("CreateEnvironmentBlock 失败");
             return Err("CreateEnvironmentBlock 失败".to_string());
@@ -243,6 +444,9 @@ pub fn start_process_in_session0(
 
         let _ = DestroyEnvironmentBlock(p_env);
         let _ = CloseHandle(h_token);
+        if !h_linked_token.is_invalid() {
+            let _ = CloseHandle(h_linked_token);
+        }
         let _ = CloseHandle(h_dup_token);
 
         if create_result.is_err() {

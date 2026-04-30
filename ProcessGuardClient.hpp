@@ -107,7 +107,7 @@ namespace ProcessGuard
         bool RemoveMonitorItem(const std::string &id);
         bool StopMonitorItem(const std::string &id);
         bool StartMonitorItem(const std::string &id);
-        bool PauseMonitorItem(const std::string &id) { return StopMonitorItem(id); }
+        bool PauseMonitorItem(const std::string &id);
         bool ResumeMonitorItem(const std::string &id) { return StartMonitorItem(id); }
 
         std::vector<MonitorItem> GetAllMonitorItems();
@@ -134,6 +134,7 @@ namespace ProcessGuard
         void StopSelfHeartbeat();
 
     private:
+        struct HeartbeatThreadEntry;
         struct Impl;
         std::unique_ptr<Impl> impl_;
     };

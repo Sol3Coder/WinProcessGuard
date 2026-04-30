@@ -139,6 +139,7 @@ pub enum ChangeType {
     Start = 1,
     Stop = 2,
     Remove = 4,
+    Pause = 8,
 }
 
 impl BitOr for ChangeType {

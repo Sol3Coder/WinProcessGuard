@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use time::macros::offset;
 use time::OffsetDateTime;
@@ -21,6 +21,33 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 const MAX_LOG_SIZE: u64 = 300 * 1024 * 1024; // 300MB
 const LOG_DIR_NAME: &str = "logs";
+
+pub(crate) struct StartupGate {
+    ready: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl StartupGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            ready: Mutex::new(false),
+            condvar: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn mark_ready(&self) {
+        let mut ready = self.ready.lock().unwrap();
+        *ready = true;
+        self.condvar.notify_all();
+    }
+
+    pub(crate) fn wait_until_ready(&self) {
+        let mut ready = self.ready.lock().unwrap();
+        while !*ready {
+            ready = self.condvar.wait(ready).unwrap();
+        }
+    }
+}
 
 /// 获取日志目录路径
 fn get_log_dir() -> PathBuf {
@@ -249,6 +276,7 @@ fn service_main(_arguments: Vec<OsString>) {
     let running_clone = running.clone();
     let running_for_pipe = running.clone();
     let running_for_guardian = running.clone();
+    let pipe_ready = Arc::new(StartupGate::new());
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
@@ -278,7 +306,10 @@ fn service_main(_arguments: Vec<OsString>) {
 
     info!("服务状态已设置为运行中");
 
-    let guardian = Arc::new(Guardian::new(running_for_guardian));
+    let guardian = Arc::new(Guardian::new(
+        running_for_guardian,
+        Some(pipe_ready.clone()),
+    ));
     let guardian_for_pipe = guardian.clone();
 
     let guardian_handle = std::thread::spawn(move || {
@@ -287,7 +318,12 @@ fn service_main(_arguments: Vec<OsString>) {
         info!("守护线程已退出");
     });
 
-    let pipe_server = PipeServer::new(guardian_for_pipe, running_for_pipe);
+    let pipe_ready_for_pipe = pipe_ready.clone();
+    let pipe_server = PipeServer::new(
+        guardian_for_pipe,
+        running_for_pipe,
+        Some(pipe_ready_for_pipe),
+    );
     let pipe_handle = std::thread::spawn(move || {
         info!("管道服务线程已启动");
         pipe_server.run();
@@ -483,4 +519,34 @@ pub fn is_service_running() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StartupGate;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn startup_gate_blocks_until_pipe_is_ready() {
+        let gate = Arc::new(StartupGate::new());
+        let unblocked = Arc::new(AtomicBool::new(false));
+
+        let gate_for_thread = gate.clone();
+        let unblocked_for_thread = unblocked.clone();
+        let waiter = thread::spawn(move || {
+            gate_for_thread.wait_until_ready();
+            unblocked_for_thread.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(!unblocked.load(Ordering::SeqCst));
+
+        gate.mark_ready();
+        waiter.join().unwrap();
+
+        assert!(unblocked.load(Ordering::SeqCst));
+    }
 }

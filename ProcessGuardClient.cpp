@@ -1,4 +1,5 @@
 #include "ProcessGuardClient.hpp"
+#include <algorithm>
 #include <sstream>
 #include <filesystem>
 #include <condition_variable>
@@ -17,6 +18,7 @@ namespace ProcessGuard
     static const char *SERVICE_NAME = "ProcessGuardService";
     static const char *PIPE_NAME = "\\\\.\\pipe\\ProcessGuardService";
     static const size_t PIPE_BUFFER_SIZE = 65536;
+    static const DWORD PIPE_REQUEST_TIMEOUT_MS = 3000;
 
     class PipeClient
     {
@@ -37,7 +39,7 @@ namespace ProcessGuard
                 HANDLE pipe = CreateFileA(
                     PIPE_NAME,
                     GENERIC_READ | GENERIC_WRITE,
-                    0, nullptr, OPEN_EXISTING, 0, nullptr);
+                    0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
 
                 if (pipe != INVALID_HANDLE_VALUE)
                 {
@@ -87,20 +89,70 @@ namespace ProcessGuard
 
             std::string requestStr = request.dump();
             DWORD bytesWritten = 0;
-
-            if (!WriteFile(pipeHandle_, requestStr.c_str(),
-                           static_cast<DWORD>(requestStr.length()), &bytesWritten, nullptr) ||
-                bytesWritten != requestStr.length())
+            OVERLAPPED writeOverlapped = {};
+            writeOverlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+            if (!writeOverlapped.hEvent)
             {
                 DisconnectInternal();
-                return {{"success", false}, {"message", "Write failed"}};
+                return {{"success", false}, {"message", "Write event creation failed"}};
+            }
+
+            BOOL writeIssued = WriteFile(
+                pipeHandle_,
+                requestStr.c_str(),
+                static_cast<DWORD>(requestStr.length()),
+                &bytesWritten,
+                &writeOverlapped);
+            if (!writeIssued)
+            {
+                DWORD error = GetLastError();
+                if (error != ERROR_IO_PENDING ||
+                    !WaitForOverlappedIo(writeOverlapped, PIPE_REQUEST_TIMEOUT_MS, bytesWritten))
+                {
+                    CloseHandle(writeOverlapped.hEvent);
+                    DisconnectInternal();
+                    return {{"success", false}, {"message", "Write failed or timed out"}};
+                }
+            }
+            CloseHandle(writeOverlapped.hEvent);
+
+            if (bytesWritten != requestStr.length())
+            {
+                DisconnectInternal();
+                return {{"success", false}, {"message", "Write incomplete"}};
             }
 
             char buffer[PIPE_BUFFER_SIZE] = {0};
             DWORD bytesRead = 0;
+            OVERLAPPED readOverlapped = {};
+            readOverlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+            if (!readOverlapped.hEvent)
+            {
+                DisconnectInternal();
+                return {{"success", false}, {"message", "Read event creation failed"}};
+            }
 
-            if (!ReadFile(pipeHandle_, buffer, PIPE_BUFFER_SIZE - 1, &bytesRead, nullptr) ||
-                bytesRead == 0)
+            BOOL readIssued = ReadFile(
+                pipeHandle_,
+                buffer,
+                PIPE_BUFFER_SIZE - 1,
+                &bytesRead,
+                &readOverlapped);
+            if (!readIssued)
+            {
+                DWORD error = GetLastError();
+                if (error != ERROR_IO_PENDING ||
+                    !WaitForOverlappedIo(readOverlapped, PIPE_REQUEST_TIMEOUT_MS, bytesRead) ||
+                    bytesRead == 0)
+                {
+                    CloseHandle(readOverlapped.hEvent);
+                    DisconnectInternal();
+                    return {{"success", false}, {"message", "Read failed or timed out"}};
+                }
+            }
+            CloseHandle(readOverlapped.hEvent);
+
+            if (bytesRead == 0)
             {
                 DisconnectInternal();
                 return {{"success", false}, {"message", "Read failed"}};
@@ -128,6 +180,18 @@ namespace ProcessGuard
         HANDLE pipeHandle_;
         bool connected_;
         std::mutex mutex_;
+
+        bool WaitForOverlappedIo(OVERLAPPED &overlapped, DWORD timeoutMs, DWORD &transferred)
+        {
+            DWORD waitResult = WaitForSingleObject(overlapped.hEvent, timeoutMs);
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                return GetOverlappedResult(pipeHandle_, &overlapped, &transferred, FALSE) != FALSE;
+            }
+
+            CancelIoEx(pipeHandle_, &overlapped);
+            return false;
+        }
 
         void DisconnectInternal()
         {
@@ -326,14 +390,19 @@ namespace ProcessGuard
         }
     };
 
+    struct Client::HeartbeatThreadEntry
+    {
+        std::shared_ptr<std::atomic<bool>> running;
+        std::unique_ptr<std::thread> thread;
+    };
+
     struct Client::Impl
     {
         std::unique_ptr<PipeClient> pipeClient;
         std::unique_ptr<ServiceManager> serviceManager;
 
         std::mutex heartbeatMutex;
-        std::map<std::string, std::unique_ptr<std::thread>> heartbeatThreads;
-        std::map<std::string, std::atomic<bool>> heartbeatRunning;
+        std::map<std::string, HeartbeatThreadEntry> heartbeatThreads;
 
         std::function<void(const std::string &)> heartbeatFailedCallback;
         std::function<void(bool)> connectedChangedCallback;
@@ -692,6 +761,40 @@ namespace ProcessGuard
         }
     }
 
+    bool Client::PauseMonitorItem(const std::string &id)
+    {
+        if (!impl_->connected && !Connect())
+            return false;
+
+        try
+        {
+            nlohmann::json request;
+            request["type"] = "pause";
+            request["id"] = id;
+
+            auto response = impl_->pipeClient->SendRequest(request);
+            impl_->connected = impl_->pipeClient->IsConnected();
+            if (!response.is_object() || !response.value("success", false))
+            {
+                impl_->lastError = response.value("message", "Unknown error");
+                return false;
+            }
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            impl_->connected = false;
+            impl_->lastError = std::string("PauseMonitorItem error: ") + e.what();
+            return false;
+        }
+        catch (...)
+        {
+            impl_->connected = false;
+            impl_->lastError = "PauseMonitorItem unknown error";
+            return false;
+        }
+    }
+
     std::vector<MonitorItem> Client::GetAllMonitorItems()
     {
         if (!impl_->connected && !Connect())
@@ -881,44 +984,64 @@ namespace ProcessGuard
         if (impl_->heartbeatThreads.find(itemId) != impl_->heartbeatThreads.end())
             return;
 
-        impl_->heartbeatRunning[itemId] = true;
-        impl_->heartbeatThreads[itemId] = std::make_unique<std::thread>([this, itemId, intervalMs]()
-                                                                        {
-        while (impl_->heartbeatRunning[itemId]) {
+        auto running = std::make_shared<std::atomic<bool>>(true);
+        auto worker = std::make_unique<std::thread>([this, itemId, intervalMs, running]()
+                                                    {
+        while (running->load()) {
             SendHeartbeat(itemId);
-            std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+
+            int sleptMs = 0;
+            while (running->load() && sleptMs < intervalMs) {
+                const int sliceMs = (std::min)(50, intervalMs - sleptMs);
+                std::this_thread::sleep_for(std::chrono::milliseconds(sliceMs));
+                sleptMs += sliceMs;
+            }
         } });
+        impl_->heartbeatThreads[itemId] = {running, std::move(worker)};
     }
 
     void Client::StopHeartbeatThread(const std::string &itemId)
     {
-        std::lock_guard<std::mutex> lock(impl_->heartbeatMutex);
-
-        auto it = impl_->heartbeatThreads.find(itemId);
-        if (it != impl_->heartbeatThreads.end())
+        std::unique_ptr<std::thread> thread;
         {
-            impl_->heartbeatRunning[itemId] = false;
-            if (it->second && it->second->joinable())
-                it->second->join();
+            std::lock_guard<std::mutex> lock(impl_->heartbeatMutex);
+
+            auto it = impl_->heartbeatThreads.find(itemId);
+            if (it == impl_->heartbeatThreads.end())
+                return;
+
+            it->second.running->store(false);
+            thread = std::move(it->second.thread);
             impl_->heartbeatThreads.erase(it);
-            impl_->heartbeatRunning.erase(itemId);
+        }
+
+        if (thread && thread->joinable())
+        {
+            thread->join();
         }
     }
 
     void Client::StopAllHeartbeatThreads()
     {
-        std::lock_guard<std::mutex> lock(impl_->heartbeatMutex);
-
-        for (auto &pair : impl_->heartbeatRunning)
-            pair.second = false;
-        for (auto &pair : impl_->heartbeatThreads)
+        std::vector<std::unique_ptr<std::thread>> threads;
         {
-            if (pair.second && pair.second->joinable())
-                pair.second->join();
+            std::lock_guard<std::mutex> lock(impl_->heartbeatMutex);
+
+            for (auto &pair : impl_->heartbeatThreads)
+            {
+                pair.second.running->store(false);
+                if (pair.second.thread)
+                    threads.push_back(std::move(pair.second.thread));
+            }
+
+            impl_->heartbeatThreads.clear();
         }
 
-        impl_->heartbeatThreads.clear();
-        impl_->heartbeatRunning.clear();
+        for (auto &thread : threads)
+        {
+            if (thread && thread->joinable())
+                thread->join();
+        }
     }
 
     bool Client::EnsureServiceInstalled(const std::string &servicePath)
