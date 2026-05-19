@@ -31,6 +31,17 @@ pub fn ensure_config_dir() -> io::Result<()> {
         fs::create_dir_all(&config_dir)?;
         info!("Created config directory: {:?}", config_dir);
     }
+
+    // Clean up stale .tmp files left behind by interrupted atomic writes
+    if let Ok(entries) = fs::read_dir(&config_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "tmp") {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -184,9 +195,25 @@ fn deduplicate_exe_paths_with_target(mut config: Config, save_path: Option<&Path
 }
 
 pub fn save_config(config: &Config) -> io::Result<()> {
+    save_config_internal(config, false)
+}
+
+/// Save config with a backup of the previous file. Use for structural changes
+/// (new items, launch method changes, removals) where losing the current state
+/// to corruption would be costly.
+pub fn save_config_with_backup(config: &Config) -> io::Result<()> {
+    save_config_internal(config, true)
+}
+
+fn save_config_internal(config: &Config, backup_first: bool) -> io::Result<()> {
     ensure_config_dir()?;
 
     let config_path = get_config_file_path();
+    let backup_path = get_config_backup_file_path();
+
+    if backup_first && config_path.exists() {
+        let _ = fs::copy(&config_path, &backup_path);
+    }
 
     info!("Saving config to: {:?}", config_path);
 
@@ -206,7 +233,13 @@ fn save_config_to_path(path: &Path, config: &Config) -> io::Result<()> {
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    fs::write(path, content)
+    // Atomic write: write to temp file first, then rename.
+    // On NTFS within the same volume, rename is a metadata operation
+    // that won't leave the file in a partially-written state.
+    let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, &content)?;
+    fs::rename(&temp_path, path)?;
+    Ok(())
 }
 
 pub fn add_item(config: &mut Config, item: MonitorItem) -> io::Result<()> {
@@ -221,7 +254,7 @@ pub fn add_item(config: &mut Config, item: MonitorItem) -> io::Result<()> {
     }
 
     config.items.push(item);
-    save_config(config)?;
+    save_config_with_backup(config)?;
 
     info!("Item added successfully");
     Ok(())
@@ -232,7 +265,7 @@ pub fn update_item(config: &mut Config, item: MonitorItem) -> io::Result<()> {
 
     if let Some(existing) = config.items.iter_mut().find(|i| i.id == item.id) {
         *existing = item;
-        save_config(config)?;
+        save_config_with_backup(config)?;
         info!("Item updated successfully");
         Ok(())
     } else {
@@ -258,7 +291,7 @@ pub fn remove_item(config: &mut Config, id: &str) -> io::Result<()> {
         ));
     }
 
-    save_config(config)?;
+    save_config_with_backup(config)?;
     info!("Item removed successfully");
     Ok(())
 }

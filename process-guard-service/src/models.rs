@@ -3,6 +3,32 @@ use std::ops::BitOr;
 use std::time::Instant;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum LaunchMethod {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "direct")]
+    Direct,
+    #[serde(rename = "direct_no_env")]
+    DirectNoEnv,
+    #[serde(rename = "suspended")]
+    Suspended,
+    #[serde(rename = "suspended_no_env")]
+    SuspendedNoEnv,
+    #[serde(rename = "raw_token")]
+    RawToken,
+    #[serde(rename = "shell_launch")]
+    ShellLaunch,
+    #[serde(rename = "cmd_exe")]
+    CmdExe,
+}
+
+impl Default for LaunchMethod {
+    fn default() -> Self {
+        LaunchMethod::Auto
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorItem {
     pub id: String,
@@ -14,6 +40,8 @@ pub struct MonitorItem {
     pub enabled: bool,
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_ms: u64,
+    #[serde(default)]
+    pub launch_method: LaunchMethod,
 }
 
 fn default_heartbeat_timeout() -> u64 {
@@ -31,6 +59,7 @@ impl MonitorItem {
             no_window: false,
             enabled: true,
             heartbeat_timeout_ms: 10000,
+            launch_method: LaunchMethod::Auto,
         }
     }
 }

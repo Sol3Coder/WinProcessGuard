@@ -1,12 +1,14 @@
 use crate::config::load_config;
 use crate::models::{ChangeType, Config, ConfigChange, MonitoredProcess, CHECK_INTERVAL_MS};
 use crate::session0::{
-    check_process_alive, find_process_by_path, kill_process, start_process_in_session0,
+    check_process_alive, find_process_by_path, get_process_status, kill_process,
+    start_process_in_session0, start_process_suspended, start_process_with_raw_token,
 };
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use windows::Win32::System::Threading::ResumeThread;
 
 fn should_kill_process_for_change(change_type: ChangeType) -> bool {
     change_type.has_flag(ChangeType::Stop)
@@ -64,7 +66,7 @@ mod tests {
     use super::{
         apply_pause_state, normalize_startup_config, should_kill_process_for_change,
     };
-    use crate::models::{ChangeType, Config, MonitorItem, MonitoredProcess};
+    use crate::models::{ChangeType, Config, LaunchMethod, MonitorItem, MonitoredProcess};
     use std::collections::HashMap;
 
     #[test]
@@ -88,6 +90,7 @@ mod tests {
             no_window: false,
             enabled: true,
             heartbeat_timeout_ms: 15_000,
+            launch_method: LaunchMethod::Auto,
         };
         let mut processes = HashMap::new();
         let mut process = MonitoredProcess::from_item(item.clone());
@@ -116,6 +119,7 @@ mod tests {
                 no_window: false,
                 enabled: false,
                 heartbeat_timeout_ms: 15_000,
+                launch_method: LaunchMethod::Auto,
             }],
         };
 
@@ -136,6 +140,7 @@ mod tests {
                 no_window: false,
                 enabled: true,
                 heartbeat_timeout_ms: 15_000,
+                launch_method: LaunchMethod::Auto,
             }],
         };
 
@@ -225,6 +230,7 @@ impl Guardian {
 
         let mut check_count: u64 = 0;
 
+        // Run the first check immediately, then sleep between cycles
         loop {
             let running = *self.running.lock().unwrap();
             if !running {
@@ -232,12 +238,13 @@ impl Guardian {
                 break;
             }
 
-            std::thread::sleep(Duration::from_millis(CHECK_INTERVAL_MS));
             check_count += 1;
 
             info!("--- Check cycle #{} ---", check_count);
             self.process_pending_changes();
             self.check_processes();
+
+            std::thread::sleep(Duration::from_millis(CHECK_INTERVAL_MS));
         }
 
         info!("Guardian stopped after {} checks", check_count);
@@ -287,9 +294,8 @@ impl Guardian {
                 continue;
             }
 
-            let process_alive = process
-                .process_id
-                .map_or(false, check_process_alive);
+            let process_status = process.process_id.and_then(get_process_status);
+            let process_alive = process_status.as_ref().map_or(false, |s| s.is_alive());
             let heartbeat_ok = !process.is_heartbeat_timeout();
 
             info!(
@@ -302,6 +308,22 @@ impl Guardian {
                 process.item.heartbeat_timeout_ms,
                 startup_elapsed.as_secs_f64()
             );
+
+            if !process_alive {
+                if let Some(status) = &process_status {
+                    if status.exit_code != 259 {
+                        warn!(
+                            "Process {} (PID={:?}) exit code: {} (0x{:08X})",
+                            process.item.name, process.process_id, status.exit_code, status.exit_code
+                        );
+                    }
+                } else {
+                    warn!(
+                        "Process {} (PID={:?}) could not be opened (access denied or already gone)",
+                        process.item.name, process.process_id
+                    );
+                }
+            }
 
             if !process_alive || !heartbeat_ok {
                 let reason = if !process_alive {
@@ -439,7 +461,7 @@ impl Guardian {
                 );
             }
             config.items.retain(|i| i.id != change.item.id);
-            if let Err(e) = crate::config::save_config(&config) {
+            if let Err(e) = crate::config::save_config_with_backup(&config) {
                 error!("Failed to persist removal: {}", e);
             }
             info!("Removed monitor item from config: {}", change.item.id);
@@ -455,14 +477,14 @@ impl Guardian {
 
                 if let Some(item) = config.items.iter_mut().find(|i| i.id == change.item.id) {
                     item.enabled = true;
-                    if let Err(e) = crate::config::save_config(&config) {
+                    if let Err(e) = crate::config::save_config_with_backup(&config) {
                         error!("Failed to persist enabled config: {}", e);
                     } else {
                         info!("Saved enabled monitor item config: {}", change.item.id);
                     }
                 } else {
                     config.items.push(change.item.clone());
-                    if let Err(e) = crate::config::save_config(&config) {
+                    if let Err(e) = crate::config::save_config_with_backup(&config) {
                         error!("Failed to persist added config: {}", e);
                     }
                 }
@@ -479,17 +501,283 @@ impl Guardian {
         self.start_process_internal(process)
     }
 
+    fn launch_with_method(
+        &self,
+        method: &crate::models::LaunchMethod,
+        exe_path: &str,
+        working_dir: Option<&str>,
+        args: Option<&str>,
+        minimize: bool,
+        no_window: bool,
+    ) -> Option<u32> {
+        use crate::models::LaunchMethod;
+
+        match method {
+            LaunchMethod::Auto | LaunchMethod::Direct => {
+                start_process_in_session0(
+                    exe_path, working_dir, args, minimize, no_window, true,
+                )
+                .ok()
+                .map(|info| info.process_id)
+            }
+            LaunchMethod::DirectNoEnv => {
+                start_process_in_session0(
+                    exe_path, working_dir, args, minimize, no_window, false,
+                )
+                .ok()
+                .map(|info| info.process_id)
+            }
+            LaunchMethod::Suspended => {
+                let info = start_process_suspended(
+                    exe_path, working_dir, args, minimize, no_window, true, false,
+                )
+                .ok()?;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                unsafe {
+                    let _ = ResumeThread(info.thread_handle);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                if check_process_alive(info.process_id) {
+                    Some(info.process_id)
+                } else {
+                    None
+                }
+            }
+            LaunchMethod::SuspendedNoEnv => {
+                let info = start_process_suspended(
+                    exe_path, working_dir, args, minimize, no_window, false, false,
+                )
+                .ok()?;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                unsafe {
+                    let _ = ResumeThread(info.thread_handle);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                if check_process_alive(info.process_id) {
+                    Some(info.process_id)
+                } else {
+                    None
+                }
+            }
+            LaunchMethod::RawToken => {
+                start_process_with_raw_token(exe_path, working_dir, args, minimize, no_window)
+                    .ok()
+                    .map(|info| info.process_id)
+            }
+            LaunchMethod::ShellLaunch => {
+                let cmd_args = format!("/c start \"\" \"{}\"", exe_path);
+                start_process_in_session0(
+                    "C:\\Windows\\System32\\cmd.exe",
+                    None,
+                    Some(&cmd_args),
+                    minimize,
+                    true,
+                    true,
+                )
+                .ok()?;
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                find_process_by_path(exe_path)
+            }
+            LaunchMethod::CmdExe => {
+                let cmd_args = format!("/c \"{}\"", exe_path);
+                start_process_in_session0(
+                    "C:\\Windows\\System32\\cmd.exe",
+                    working_dir,
+                    Some(&cmd_args),
+                    minimize,
+                    true,
+                    true,
+                )
+                .ok()?;
+                for attempt in 0..3 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if let Some(pid) = find_process_by_path(exe_path) {
+                        if check_process_alive(pid) {
+                            info!(
+                                "CmdExe launch succeeded on attempt {}: PID {}",
+                                attempt + 1,
+                                pid
+                            );
+                            return Some(pid);
+                        }
+                    }
+                }
+                warn!("CmdExe launch: process not found after 3 attempts");
+                None
+            }
+        }
+    }
+
+    fn save_launch_method(
+        &self,
+        process: &mut MonitoredProcess,
+        method: crate::models::LaunchMethod,
+    ) {
+        process.item.launch_method = method.clone();
+
+        let mut config = self.config.lock().unwrap();
+        if let Some(item) = config.items.iter_mut().find(|i| i.id == process.item.id) {
+            item.launch_method = method.clone();
+        }
+
+        let save_result = crate::config::save_config_with_backup(&config);
+        drop(config);
+
+        if let Err(e) = save_result {
+            error!("Failed to persist launch method: {}", e);
+        } else {
+            info!(
+                "Saved launch method {:?} for {} to config",
+                method, process.item.name
+            );
+        }
+    }
+
+    fn diagnose_launch_failure(
+        &self,
+        exe_path: &str,
+        working_dir: Option<&str>,
+        args: Option<&str>,
+        minimize: bool,
+        no_window: bool,
+        process: &mut MonitoredProcess,
+    ) {
+        use crate::models::LaunchMethod;
+
+        warn!("=== Launch failure diagnostics for {} ===", process.item.name);
+
+        // Test 1: without env block
+        warn!("Test 1: without environment block (DirectNoEnv)");
+        if let Some(pid) = self.launch_with_method(
+            &LaunchMethod::DirectNoEnv, exe_path, working_dir, args, minimize, no_window,
+        ) {
+            info!("Test 1 PASSED: process alive without env block (PID {})", pid);
+            process.process_id = Some(pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now();
+            self.save_launch_method(process, LaunchMethod::DirectNoEnv);
+            return;
+        }
+        warn!("Test 1 FAILED");
+
+        // Test 2: suspended without desktop
+        warn!("Test 2: suspended without desktop (Suspended)");
+        if let Some(pid) = self.launch_with_method(
+            &LaunchMethod::Suspended, exe_path, working_dir, args, minimize, no_window,
+        ) {
+            info!("Test 2 PASSED: process alive via suspended launch (PID {})", pid);
+            process.process_id = Some(pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now();
+            self.save_launch_method(process, LaunchMethod::Suspended);
+            return;
+        }
+        warn!("Test 2 FAILED");
+
+        // Test 3: suspended, no env, no desktop
+        warn!("Test 3: suspended, no env, no desktop (SuspendedNoEnv)");
+        if let Some(pid) = self.launch_with_method(
+            &LaunchMethod::SuspendedNoEnv, exe_path, working_dir, args, minimize, no_window,
+        ) {
+            info!("Test 3 PASSED: process alive via suspended (no env) launch (PID {})", pid);
+            process.process_id = Some(pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now();
+            self.save_launch_method(process, LaunchMethod::SuspendedNoEnv);
+            return;
+        }
+        warn!("Test 3 FAILED");
+
+        // Test 4: raw WTS token
+        warn!("Test 4: raw WTS token (RawToken)");
+        if let Some(pid) = self.launch_with_method(
+            &LaunchMethod::RawToken, exe_path, working_dir, args, minimize, no_window,
+        ) {
+            info!("Test 4 PASSED: process alive with raw WTS token (PID {})", pid);
+            process.process_id = Some(pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now();
+            self.save_launch_method(process, LaunchMethod::RawToken);
+            return;
+        }
+        warn!("Test 4 FAILED");
+
+        // Test 5: shell launch via cmd.exe /c start
+        warn!("Test 5: shell launch via cmd.exe /c start (ShellLaunch)");
+        if let Some(pid) = self.launch_with_method(
+            &LaunchMethod::ShellLaunch, exe_path, working_dir, args, minimize, no_window,
+        ) {
+            info!("Test 5 PASSED: process alive via shell launch (PID {})", pid);
+            process.process_id = Some(pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now();
+            self.save_launch_method(process, LaunchMethod::ShellLaunch);
+            return;
+        }
+        warn!("Test 5 FAILED");
+
+        // Test 6: cmd.exe /c <exe>
+        warn!("Test 6: cmd.exe /c <exe> (CmdExe)");
+        if let Some(pid) = self.launch_with_method(
+            &LaunchMethod::CmdExe, exe_path, working_dir, args, minimize, no_window,
+        ) {
+            info!("Test 6 PASSED: process alive via cmd.exe parent (PID {})", pid);
+            process.process_id = Some(pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now();
+            self.save_launch_method(process, LaunchMethod::CmdExe);
+            return;
+        }
+        warn!("Test 6 FAILED");
+
+        warn!("=== All diagnostic tests FAILED for {} ===", process.item.name);
+    }
+
+    /// Quick fallback: launch via cmd.exe /c <exe> — works around
+    /// STATUS_STACK_BUFFER_OVERRUN that some runtimes (Flutter/Dart) hit when
+    /// launched directly via CreateProcessAsUserW.
+    fn try_launch_via_cmd(
+        &self,
+        exe_path: &str,
+        working_dir: Option<&str>,
+        minimize: bool,
+        process: &mut MonitoredProcess,
+    ) -> bool {
+        use crate::models::LaunchMethod;
+        info!("Falling back to cmd.exe /c launch for {}", process.item.name);
+        let args = process.item.args.clone();
+        let no_window = process.item.no_window;
+        if let Some(pid) = self.launch_with_method(
+            &LaunchMethod::CmdExe,
+            exe_path,
+            working_dir,
+            args.as_deref(),
+            minimize,
+            no_window,
+        ) {
+            process.process_id = Some(pid);
+            process.last_heartbeat = Instant::now();
+            process.startup_time = Instant::now();
+            self.save_launch_method(process, LaunchMethod::CmdExe);
+            true
+        } else {
+            false
+        }
+    }
+
     fn start_process_internal(&self, process: &mut MonitoredProcess) -> Result<(), String> {
-        let exe_path = &process.item.exe_path;
+        use crate::models::LaunchMethod;
+
+        let exe_path = process.item.exe_path.clone();
 
         info!("Starting process: {}", exe_path);
 
-        if !std::path::Path::new(exe_path).exists() {
+        if !std::path::Path::new(&exe_path).exists() {
             error!("Executable not found: {}", exe_path);
             return Err(format!("Executable not found: {}", exe_path));
         }
 
-        if let Some(existing_pid) = find_process_by_path(exe_path) {
+        if let Some(existing_pid) = find_process_by_path(&exe_path) {
             info!(
                 "Found running process {} (PID: {}), reusing it",
                 process.item.name, existing_pid
@@ -500,29 +788,126 @@ impl Guardian {
             return Ok(());
         }
 
-        let working_dir = std::path::Path::new(exe_path)
+        let working_dir = std::path::Path::new(&exe_path)
             .parent()
             .and_then(|p| p.to_str())
             .map(|s| s.to_string());
 
-        let args = process.item.args.as_deref();
+        let args = process.item.args.clone();
+        let minimize = process.item.minimize;
+        let no_window = process.item.no_window;
+        let launch_method = process.item.launch_method.clone();
 
-        let proc_info = start_process_in_session0(
-            exe_path,
+        // If a specific (non-auto) launch method was saved, try it first
+        if launch_method != LaunchMethod::Auto {
+            info!(
+                "Using recorded launch method {:?} for {}",
+                launch_method, process.item.name
+            );
+            if let Some(pid) = self.launch_with_method(
+                &launch_method,
+                &exe_path,
+                working_dir.as_deref(),
+                args.as_deref(),
+                minimize,
+                no_window,
+            ) {
+                process.process_id = Some(pid);
+                process.last_heartbeat = Instant::now();
+                process.startup_time = Instant::now();
+                info!(
+                    "Started {} with PID {} via {:?}",
+                    process.item.name, pid, launch_method
+                );
+                return Ok(());
+            }
+            warn!(
+                "Recorded launch method {:?} failed for {}, falling back to auto diagnostics",
+                launch_method, process.item.name
+            );
+        }
+
+        // Auto: try Direct first
+        match self.launch_with_method(
+            &LaunchMethod::Direct,
+            &exe_path,
             working_dir.as_deref(),
-            args,
-            process.item.minimize,
-            process.item.no_window,
-        )?;
+            args.as_deref(),
+            minimize,
+            no_window,
+        ) {
+            Some(pid) => {
+                process.process_id = Some(pid);
+                process.last_heartbeat = Instant::now();
+                process.startup_time = Instant::now();
+                info!(
+                    "Started monitored process {} with PID {}",
+                    process.item.name, pid
+                );
 
-        process.process_id = Some(proc_info.process_id);
-        process.last_heartbeat = Instant::now();
-        process.startup_time = Instant::now();
+                // Check if the process survives the first 500ms
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let process_crashed = match get_process_status(pid) {
+                    Some(status) if status.is_alive() => {
+                        debug!(
+                            "Process {} (PID {}) confirmed alive 500ms after launch",
+                            process.item.name, pid
+                        );
+                        false
+                    }
+                    Some(status) => {
+                        warn!(
+                            "Process {} (PID {}) exited within 500ms of launch! Exit code: {} (0x{:08X})",
+                            process.item.name, pid, status.exit_code, status.exit_code
+                        );
+                        true
+                    }
+                    None => {
+                        warn!(
+                            "Process {} (PID {}) disappeared within 500ms of launch",
+                            process.item.name, pid
+                        );
+                        true
+                    }
+                };
 
-        info!(
-            "Started monitored process {} with PID {}",
-            process.item.name, proc_info.process_id
-        );
+                if process_crashed {
+                    // Fast fallback: try cmd.exe /c (common fix for Flutter/Dart)
+                    if !self.try_launch_via_cmd(
+                        &exe_path,
+                        working_dir.as_deref(),
+                        minimize,
+                        process,
+                    ) {
+                        let args_owned = args.clone();
+                        self.diagnose_launch_failure(
+                            &exe_path,
+                            working_dir.as_deref(),
+                            args_owned.as_deref(),
+                            minimize,
+                            no_window,
+                            process,
+                        );
+                    }
+                }
+            }
+            None => {
+                // Direct launch failed entirely, run full diagnostics
+                warn!(
+                    "Direct launch failed for {}, running full diagnostics",
+                    process.item.name
+                );
+                let args_owned = args.clone();
+                self.diagnose_launch_failure(
+                    &exe_path,
+                    working_dir.as_deref(),
+                    args_owned.as_deref(),
+                    minimize,
+                    no_window,
+                    process,
+                );
+            }
+        }
 
         Ok(())
     }

@@ -10,9 +10,9 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetExitCodeProcess, OpenProcess, TerminateProcess,
-    CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS,
-    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
-    STARTUPINFOW, STARTUPINFOW_FLAGS, PROCESS_VM_READ,
+    CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    DETACHED_PROCESS, NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    PROCESS_TERMINATE, STARTUPINFOW, STARTUPINFOW_FLAGS, PROCESS_VM_READ,
 };
 
 const MAXIMUM_ALLOWED: u32 = 0x02000000;
@@ -106,6 +106,38 @@ impl Drop for ProcessInfo {
             }
         }
     }
+}
+
+use std::io::{Read, Seek, SeekFrom};
+
+const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3;
+
+struct RvaInfo {
+    e_lfanew: u32,
+}
+
+fn read_dos_rva(exe_path: &str) -> Option<RvaInfo> {
+    let mut file = std::fs::File::open(exe_path).ok()?;
+    let mut dos_header = [0u8; 64];
+    file.read_exact(&mut dos_header).ok()?;
+    let e_lfanew = u32::from_le_bytes([
+        dos_header[0x3C],
+        dos_header[0x3D],
+        dos_header[0x3E],
+        dos_header[0x3F],
+    ]);
+    Some(RvaInfo { e_lfanew })
+}
+
+fn read_pe_subsystem(exe_path: &str) -> Option<u16> {
+    let rva = read_dos_rva(exe_path)?;
+    let mut file = std::fs::File::open(exe_path).ok()?;
+    // PE sig (4) + COFF header (20) + subsystem offset in optional header (68) = 92
+    file.seek(SeekFrom::Start(rva.e_lfanew as u64 + 4 + 20 + 68))
+        .ok()?;
+    let mut buf = [0u8; 2];
+    file.read_exact(&mut buf).ok()?;
+    Some(u16::from_le_bytes(buf))
 }
 
 fn to_wide_string(s: &str) -> Vec<u16> {
@@ -308,6 +340,45 @@ pub fn start_process_in_session0(
     args: Option<&str>,
     minimize: bool,
     no_window: bool,
+    use_env_block: bool,
+) -> Result<ProcessInfo, String> {
+    start_process_internal(exe_path, working_dir, args, minimize, no_window, use_env_block, true, false, true)
+}
+
+/// Diagnostic: creates process suspended for crash isolation
+pub fn start_process_suspended(
+    exe_path: &str,
+    working_dir: Option<&str>,
+    args: Option<&str>,
+    minimize: bool,
+    no_window: bool,
+    use_env_block: bool,
+    set_desktop: bool,
+) -> Result<ProcessInfo, String> {
+    start_process_internal(exe_path, working_dir, args, minimize, no_window, use_env_block, set_desktop, true, true)
+}
+
+/// Launch using the raw WTS token (no DuplicateTokenEx)
+pub fn start_process_with_raw_token(
+    exe_path: &str,
+    working_dir: Option<&str>,
+    args: Option<&str>,
+    minimize: bool,
+    no_window: bool,
+) -> Result<ProcessInfo, String> {
+    start_process_internal(exe_path, working_dir, args, minimize, no_window, true, true, false, false)
+}
+
+fn start_process_internal(
+    exe_path: &str,
+    working_dir: Option<&str>,
+    args: Option<&str>,
+    minimize: bool,
+    no_window: bool,
+    use_env_block: bool,
+    set_desktop: bool,
+    suspended: bool,
+    use_duplication: bool,
 ) -> Result<ProcessInfo, String> {
     unsafe {
         let mut process_info = ProcessInfo::new();
@@ -363,56 +434,95 @@ pub fn start_process_in_session0(
             }
         };
 
-        let dup_result = DuplicateTokenEx(
-            duplicate_source_token,
-            MAXIMUM_ALLOWED,
-            ptr::null_mut(),
-            SECURITY_IDENTIFICATION,
-            TOKEN_PRIMARY,
-            &mut h_dup_token,
-        );
+        if use_duplication {
+            let dup_result = DuplicateTokenEx(
+                duplicate_source_token,
+                MAXIMUM_ALLOWED,
+                ptr::null_mut(),
+                SECURITY_IDENTIFICATION,
+                TOKEN_PRIMARY,
+                &mut h_dup_token,
+            );
 
-        if dup_result == 0 {
-            let err = windows::core::Error::from_win32();
-            let _ = CloseHandle(h_token);
-            if !h_linked_token.is_invalid() {
-                let _ = CloseHandle(h_linked_token);
+            if dup_result == 0 {
+                let err = windows::core::Error::from_win32();
+                let _ = CloseHandle(h_token);
+                if !h_linked_token.is_invalid() {
+                    let _ = CloseHandle(h_linked_token);
+                }
+                error!("DuplicateTokenEx 失败: {:?}", err);
+                return Err(format!("DuplicateTokenEx 失败: {:?}", err));
             }
-            error!("DuplicateTokenEx 失败: {:?}", err);
-            return Err(format!("DuplicateTokenEx 失败: {:?}", err));
+            info!("Session {} duplicated primary token diagnostics: {}", session_id, describe_token_elevation(h_dup_token));
+        } else {
+            // Use the raw WTS token directly
+            info!("Session {} using raw WTS token (no duplication), diagnostics: {}", session_id, describe_token_elevation(duplicate_source_token));
         }
-        info!("Session {} duplicated primary token diagnostics: {}", session_id, describe_token_elevation(h_dup_token));
 
-        let env_result = CreateEnvironmentBlock(&mut p_env, h_dup_token, false);
+        let effective_token = if use_duplication { h_dup_token } else { duplicate_source_token };
+
+        let env_result = if use_env_block {
+            CreateEnvironmentBlock(&mut p_env, effective_token, false)
+        } else {
+            1 // non-zero = success, skip env block (pass NULL to inherit)
+        };
         if env_result == 0 {
             let _ = CloseHandle(h_token);
             if !h_linked_token.is_invalid() {
                 let _ = CloseHandle(h_linked_token);
             }
-            let _ = CloseHandle(h_dup_token);
+            if use_duplication {
+                let _ = CloseHandle(h_dup_token);
+            }
             error!("CreateEnvironmentBlock 失败");
             return Err("CreateEnvironmentBlock 失败".to_string());
+        }
+
+        if !use_env_block {
+            info!("Skipping environment block, process will inherit service environment");
         }
 
         let mut startup_info: STARTUPINFOW = std::mem::zeroed();
         startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
 
-        let desktop = to_wide_string("winsta0\\default");
-        startup_info.lpDesktop = PWSTR(desktop.as_ptr() as *mut u16);
+        let desktop;
+        if set_desktop {
+            desktop = to_wide_string("winsta0\\default");
+            startup_info.lpDesktop = PWSTR(desktop.as_ptr() as *mut u16);
+            debug!("Setting lpDesktop to winsta0\\default");
+        } else {
+            debug!("Leaving lpDesktop as NULL (inherit default)");
+        }
 
         if minimize {
             startup_info.dwFlags = STARTUPINFOW_FLAGS(0x00000001);
             startup_info.wShowWindow = 2;
         }
 
-        let mut creation_flags = CREATE_UNICODE_ENVIRONMENT | NORMAL_PRIORITY_CLASS;
+        let subsystem = read_pe_subsystem(exe_path);
+        let mut creation_flags = NORMAL_PRIORITY_CLASS;
+        if use_env_block {
+            creation_flags |= CREATE_UNICODE_ENVIRONMENT;
+        }
+        if suspended {
+            creation_flags |= CREATE_SUSPENDED;
+            debug!("Using CREATE_SUSPENDED for diagnostic process creation");
+        }
         if no_window {
             creation_flags |= CREATE_NO_WINDOW;
         } else {
-            creation_flags |= CREATE_NEW_CONSOLE;
+            match subsystem {
+                Some(IMAGE_SUBSYSTEM_WINDOWS_CUI) => {
+                    creation_flags |= CREATE_NEW_CONSOLE;
+                    debug!("exe is console subsystem, using CREATE_NEW_CONSOLE");
+                }
+                _ => {
+                    creation_flags |= DETACHED_PROCESS;
+                    debug!("exe is GUI subsystem (or unknown), using DETACHED_PROCESS");
+                }
+            }
         }
 
-        let exe_wide = to_wide_string(exe_path);
         let mut cmd_line: Vec<u16> = if let Some(a) = args {
             let cmd = format!("\"{}\" {}", exe_path, a);
             to_wide_string(&cmd)
@@ -428,26 +538,39 @@ pub fn start_process_in_session0(
 
         let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
 
+        let env_arg: Option<*const std::ffi::c_void> = if use_env_block {
+            Some(p_env as *const std::ffi::c_void)
+        } else {
+            None
+        };
+
+        // Pass NULL for lpApplicationName — let Windows resolve the exe from the
+        // command line. Passing both lpApplicationName AND the exe path in lpCommandLine
+        // can confuse some runtimes (e.g. Flutter/Dart) during initialization.
         let create_result = CreateProcessAsUserW(
-            h_dup_token,
-            PCWSTR(exe_wide.as_ptr()),
+            effective_token,
+            PCWSTR::null(),
             PWSTR(cmd_line.as_mut_ptr()),
             None,
             None,
             false,
             creation_flags,
-            Some(p_env),
+            env_arg,
             cwd_ptr,
             &mut startup_info,
             &mut proc_info,
         );
 
-        let _ = DestroyEnvironmentBlock(p_env);
+        if use_env_block {
+            let _ = DestroyEnvironmentBlock(p_env);
+        }
         let _ = CloseHandle(h_token);
         if !h_linked_token.is_invalid() {
             let _ = CloseHandle(h_linked_token);
         }
-        let _ = CloseHandle(h_dup_token);
+        if use_duplication {
+            let _ = CloseHandle(h_dup_token);
+        }
 
         if create_result.is_err() {
             let err = windows::core::Error::from_win32();
@@ -470,25 +593,49 @@ pub fn start_process_in_session0(
 }
 
 pub fn check_process_alive(process_id: u32) -> bool {
+    get_process_status(process_id).map_or(false, |s| s.is_alive())
+}
+
+pub struct ProcessStatus {
+    pub alive: bool,
+    pub exit_code: u32,
+}
+
+impl ProcessStatus {
+    pub fn is_alive(&self) -> bool {
+        self.alive
+    }
+}
+
+const STILL_ACTIVE: u32 = 259;
+
+pub fn get_process_status(process_id: u32) -> Option<ProcessStatus> {
     if process_id == 0 {
-        return false;
+        return None;
     }
 
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_INFORMATION, false, process_id) {
             Ok(h) => h,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         if handle.is_invalid() {
-            return false;
+            return None;
         }
 
         let mut exit_code: u32 = 0;
         let result = GetExitCodeProcess(handle, &mut exit_code);
         let _ = CloseHandle(handle);
 
-        result.is_ok() && exit_code == 259
+        if result.is_err() {
+            return None;
+        }
+
+        Some(ProcessStatus {
+            alive: exit_code == STILL_ACTIVE,
+            exit_code,
+        })
     }
 }
 
