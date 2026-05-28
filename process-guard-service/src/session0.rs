@@ -777,3 +777,131 @@ pub fn find_process_by_path(exe_path: &str) -> Option<u32> {
         None
     }
 }
+
+// ── Windows Service management ──────────────────────────────────────────
+
+/// Check whether a Windows service is in the SERVICE_RUNNING state.
+pub fn check_service_running(service_name: &str) -> bool {
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+        SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let scm = OpenSCManagerW(
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SC_MANAGER_CONNECT,
+        );
+        if scm.is_err() {
+            return false;
+        }
+        let scm = scm.unwrap();
+        if scm.is_invalid() {
+            return false;
+        }
+
+        let name_wide: Vec<u16> = std::ffi::OsStr::new(service_name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let svc = OpenServiceW(scm, PCWSTR(name_wide.as_ptr()), SERVICE_QUERY_STATUS);
+        if svc.is_err() {
+            let _ = CloseServiceHandle(scm);
+            return false;
+        }
+        let svc = svc.unwrap();
+        if svc.is_invalid() {
+            let _ = CloseServiceHandle(scm);
+            return false;
+        }
+
+        let mut status = SERVICE_STATUS::default();
+        let result = QueryServiceStatus(svc, &mut status);
+
+        let _ = CloseServiceHandle(svc);
+        let _ = CloseServiceHandle(scm);
+
+        result.is_ok() && status.dwCurrentState == SERVICE_RUNNING
+    }
+}
+
+/// Start a Windows service by name. Returns Ok once the start command is
+/// sent successfully (does NOT wait for the service to reach running state).
+pub fn start_windows_service(service_name: &str) -> Result<(), String> {
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, StartServiceW,
+        SC_MANAGER_CONNECT, SERVICE_START,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let scm = OpenSCManagerW(
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SC_MANAGER_CONNECT,
+        );
+        if scm.is_err() {
+            return Err(format!("OpenSCManagerW failed: {:?}", scm.unwrap_err()));
+        }
+        let scm = scm.unwrap();
+        if scm.is_invalid() {
+            return Err("OpenSCManagerW returned invalid handle".to_string());
+        }
+
+        let name_wide: Vec<u16> = std::ffi::OsStr::new(service_name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let svc = OpenServiceW(scm, PCWSTR(name_wide.as_ptr()), SERVICE_START);
+        if svc.is_err() {
+            let _ = CloseServiceHandle(scm);
+            return Err(format!("OpenServiceW failed for '{}'", service_name));
+        }
+        let svc = svc.unwrap();
+        if svc.is_invalid() {
+            let _ = CloseServiceHandle(scm);
+            return Err(format!("Service '{}' not found", service_name));
+        }
+
+        let result = StartServiceW(svc, None);
+        let _ = CloseServiceHandle(svc);
+        let _ = CloseServiceHandle(scm);
+
+        if result.is_err() {
+            let err = windows::core::Error::from_win32();
+            return Err(format!("StartServiceW failed for '{}': {:?}", service_name, err));
+        }
+        Ok(())
+    }
+}
+
+/// Ensure a Windows service is running. If it is already running the call
+/// returns immediately. Otherwise it attempts to start the service and
+/// polls every second for up to 30 seconds waiting for SERVICE_RUNNING.
+pub fn ensure_service_running(service_name: &str) -> Result<(), String> {
+    if check_service_running(service_name) {
+        debug!("Service '{}' is already running", service_name);
+        return Ok(());
+    }
+
+    info!("Service '{}' is not running, attempting to start", service_name);
+    start_windows_service(service_name)?;
+
+    // Wait for the service to reach the running state.
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if check_service_running(service_name) {
+            info!("Service '{}' started successfully", service_name);
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "Service '{}' did not reach running state within 30 seconds",
+        service_name
+    ))
+}

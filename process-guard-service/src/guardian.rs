@@ -91,6 +91,7 @@ mod tests {
             enabled: true,
             heartbeat_timeout_ms: 15_000,
             launch_method: LaunchMethod::Auto,
+            dependencies: Vec::new(),
         };
         let mut processes = HashMap::new();
         let mut process = MonitoredProcess::from_item(item.clone());
@@ -120,6 +121,7 @@ mod tests {
                 enabled: false,
                 heartbeat_timeout_ms: 15_000,
                 launch_method: LaunchMethod::Auto,
+                dependencies: Vec::new(),
             }],
         };
 
@@ -141,6 +143,7 @@ mod tests {
                 enabled: true,
                 heartbeat_timeout_ms: 15_000,
                 launch_method: LaunchMethod::Auto,
+                dependencies: Vec::new(),
             }],
         };
 
@@ -242,6 +245,7 @@ impl Guardian {
 
             info!("--- Check cycle #{} ---", check_count);
             self.process_pending_changes();
+            self.ensure_postgresql_running();
             self.check_processes();
 
             std::thread::sleep(Duration::from_millis(CHECK_INTERVAL_MS));
@@ -765,6 +769,24 @@ impl Guardian {
         }
     }
 
+    /// Ensure the hardcoded PostgreSQL service is running. Called on every
+    /// check cycle so that a crashed Postgres is restarted promptly.
+    fn ensure_postgresql_running(&self) {
+        const PG_SERVICE_NAME: &str = "postgresql-x64-18";
+        if !crate::session0::check_service_running(PG_SERVICE_NAME) {
+            warn!(
+                "PostgreSQL service '{}' is not running, attempting restart",
+                PG_SERVICE_NAME
+            );
+            if let Err(e) = crate::session0::ensure_service_running(PG_SERVICE_NAME) {
+                error!(
+                    "Failed to restart PostgreSQL service '{}': {}",
+                    PG_SERVICE_NAME, e
+                );
+            }
+        }
+    }
+
     fn start_process_internal(&self, process: &mut MonitoredProcess) -> Result<(), String> {
         use crate::models::LaunchMethod;
 
@@ -786,6 +808,18 @@ impl Guardian {
             process.last_heartbeat = Instant::now();
             process.startup_time = Instant::now();
             return Ok(());
+        }
+
+        // Ensure hardcoded PostgreSQL dependency is running before launch.
+        // Postgres runs as a Windows service in Session 0 — use SCM, not
+        // CreateProcessAsUser.
+        const PG_SERVICE_NAME: &str = "postgresql-x64-18";
+        if let Err(e) = crate::session0::ensure_service_running(PG_SERVICE_NAME) {
+            error!(
+                "PostgreSQL service '{}' is required but could not be started: {}",
+                PG_SERVICE_NAME, e
+            );
+            return Err(format!("PostgreSQL dependency not met: {}", e));
         }
 
         let working_dir = std::path::Path::new(&exe_path)

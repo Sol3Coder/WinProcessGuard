@@ -42,6 +42,10 @@ pub struct MonitorItem {
     pub heartbeat_timeout_ms: u64,
     #[serde(default)]
     pub launch_method: LaunchMethod,
+    /// Windows service names that must be running before this process starts.
+    /// If a dependency is stopped, the guardian will attempt to start it.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 fn default_heartbeat_timeout() -> u64 {
@@ -60,6 +64,7 @@ impl MonitorItem {
             enabled: true,
             heartbeat_timeout_ms: 10000,
             launch_method: LaunchMethod::Auto,
+            dependencies: Vec::new(),
         }
     }
 }
